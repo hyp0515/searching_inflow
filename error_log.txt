@@ -1,0 +1,11 @@
+Error extracting spectrum for index 6259: Optimal parameters not found: Number of calls to function has reached maxfev = 100000.
+Error extracting spectrum for index 12916: Optimal parameters not found: Number of calls to function has reached maxfev = 100000.
+Error extracting spectrum for index 21660: `ydata` must not be empty!
+Error extracting spectrum for index 32858: The number of func parameters=8 must not exceed the number of data points=2
+Error extracting spectrum for index 44356: Optimal parameters not found: Number of calls to function has reached maxfev = 100000.
+Error extracting spectrum for index 52227: Optimal parameters not found: Number of calls to function has reached maxfev = 100000.
+Error extracting spectrum for index 67610: `ydata` must not be empty!
+Error extracting spectrum for index 68883: Optimal parameters not found: Number of calls to function has reached maxfev = 100000.
+Error extracting spectrum for index 69710: Optimal parameters not found: Number of calls to function has reached maxfev = 100000.
+Error extracting spectrum for index 86985: Optimal parameters not found: Number of calls to function has reached maxfev = 100000.
+Error extracting spectrum for index 94832: Optimal parameters not found: Number of calls to function has reached maxfev = 100000.
