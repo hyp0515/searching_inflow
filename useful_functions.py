@@ -5,10 +5,10 @@ from scipy.optimize import curve_fit
 import requests
 import json
 from pathlib import Path
+import warnings
 
 c = const.c.cgs.value * 1e-5  # speed of light in km/s
 desi_wavelength = np.arange(3600, 9824 + .8, .8) # DESI's observe wavelength
-
 
 # https://astronomy.nmsu.edu/drewski/tableofemissionlines.html
 lines_air = {
@@ -21,7 +21,6 @@ lines_air = {
     'CaII': [8498.020, 8542.090, 8662.140],
     'NaD': [5890.004, 5895.985],
 }
-
 
 def air2vac(wave):
     """
@@ -127,21 +126,6 @@ def model(lam, gaussian_parms=None, conti_parms=(0, 0)):
 
     return flux + conti
 
-# def fit_flux(lam, flux, ivar, z, fitting_model=model, lam0=None, region=None):
-    
-
-    
-#     if region is not None:
-#         crop_region = (lam >= region[0]) & (lam <= region[1])
-#         lam = lam[crop_region]
-#         flux = flux[crop_region]
-#         ivar = ivar[crop_region]
-#     sigma = np.sqrt(1 / ivar)
-    
-    
-    
-    
-
 def image_link(RA, DEC, save_image=False, fname=None):
     if save_image:
         side_arcmin = 0.5
@@ -156,10 +140,8 @@ def image_link(RA, DEC, save_image=False, fname=None):
         print(f"Saved {fname if fname else 'cutout.jpg'}")
     return f'https://www.legacysurvey.org/viewer?ra={RA}&dec={DEC}&layer=ls-dr10-grz&zoom=14'
 
-
 def spectrum_link(targetID):
     return f'https://www.legacysurvey.org/viewer/desi-spectrum/dr1/targetid{targetID}'
-
 
 def chisq(observed, model, ivar):
     sigma = np.sqrt(1 / ivar)
@@ -170,26 +152,42 @@ def chisq(observed, model, ivar):
 ################################################################################################################
 class Spectrum:
     
-    def __init__(self, fits_data):
-        self.fits_data = fits_data
+    def __init__(self, spectra_data, color_data):
         
-        self.n_spectra      = len(fits_data[1].data)
-        self.targetID       = np.array(fits_data[1].data[:]['TARGETID'])
-        self.z_pipe         = np.array(fits_data[1].data[:]['Z'])
+        targetID_spectra = spectra_data[1].data[:]['TARGETID'] # spectra catalog has 100638 spectra
+        targetID_color    = color_data[1].data[:]['TARGETID'] # color catalog has 100642 spectra
+        rearranged_indices = np.searchsorted(targetID_color, targetID_spectra)
+        targetID_color = targetID_color[rearranged_indices]
+
+        self.targetID       = np.array(targetID_spectra)
+        self.z_pipe         = np.array(spectra_data[1].data['Z'])
         self.z              = self.z_pipe.copy()
-        self.RA             = np.array(fits_data[1].data[:]['RA'])
-        self.DEC            = np.array(fits_data[1].data[:]['DEC'])
-        self.coadd_data     = np.array(fits_data[2].data)[:, 0, :]
-        self.ivar           = np.array(fits_data[3].data)[:, 0, :]
-        self.mask           = np.array(fits_data[4].data)[:, 0, :]
-        self.data_type      = 'ALL' 
+        self.RA             = spectra_data[1].data['RA']
+        self.DEC            = spectra_data[1].data['DEC']
+        
+        coadd_data          = spectra_data[2].data
+        self.coadd_data     = np.take(coadd_data, 0, axis=1)
+        ivar                = spectra_data[3].data
+        self.ivar           = np.take(ivar, 0, axis=1)
+        mask                = spectra_data[4].data
+        self.mask           = np.take(mask, 0, axis=1)
+
+        g_flux = color_data[1].data['FLUX_G']
+        r_flux = color_data[1].data['FLUX_R']
+        z_flux = color_data[1].data['FLUX_Z']
+        w1_flux = color_data[1].data['FLUX_W1']
+        w2_flux = color_data[1].data['FLUX_W2']
+        color_flux = np.vstack([g_flux, r_flux, z_flux, w1_flux, w2_flux]).T
+        
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            self.color_mag = (22.5 - 2.5 * np.log10(color_flux))[rearranged_indices, :]
+        
+        self.n_spectra      = len(spectra_data[1].data)
         self.adjust_z_mode   = [[] for _ in range(self.n_spectra)]
         self.line_detections = [[] for _ in range(self.n_spectra)]
         self.target_label    = [[] for _ in range(self.n_spectra)]
         self.subtype        = 'Original'
-        self.smooth_spectrum()
-    
-    def smooth_spectrum(self):
         self.smoothed_flux = smooth_spectrum(self.coadd_data, sigma=1)
         
     def add_attributes(self, attr_names, attr_values):
@@ -209,12 +207,13 @@ class Spectrum:
         self.z              = self.z[::indices]
         self.RA             = self.RA[::indices]
         self.DEC            = self.DEC[::indices]
-        self.coadd_data     = self.coadd_data[::indices][:]
-        self.ivar           = self.ivar[::indices][:]
-        self.mask           = self.mask[::indices][:]
-        self.smoothed_flux  = self.smoothed_flux[::indices][:]
-        self.target_label   = self.target_label[::indices][:]
-        self.line_detections= self.line_detections[::indices][:]
+        self.coadd_data     = self.coadd_data[::indices]
+        self.ivar           = self.ivar[::indices]
+        self.mask           = self.mask[::indices]
+        self.color_mag      = self.color_mag[::indices]
+        self.smoothed_flux  = self.smoothed_flux[::indices]
+        self.target_label   = self.target_label[::indices]
+        self.line_detections= self.line_detections[::indices]
     
     #
     # Translate targetID to index
@@ -229,11 +228,58 @@ class Spectrum:
         except IndexError:
             print(f"targetID {targetID} not found in the dataset.")
             return None
-             
+        
+    #
+    # Color criteria
+    #
+    
+    def color_criteria(self, criterion='g-r>=0.85', exclude=True):
+        operators = {
+            '>=': lambda x, y: x >= y,
+            '<=': lambda x, y: x <= y,
+            '>': lambda x, y: x > y,
+            '<': lambda x, y: x < y,
+        }
+        if not any(op in criterion for op in operators.keys()):
+            print(f"Criterion '{criterion}' not recognized. Available criteria: {list(operators.keys())}")
+            return np.array([False] * self.n_spectra)
+        
+        
+        left_color, right_color = criterion.split('-')
+        if any(op in right_color for op in operators.keys()):
+            operator = next(op for op in operators.keys() if op in right_color)
+            right_color, val = right_color.split(operator)
+        else:
+            print(f"Criterion '{criterion}' not recognized. Available criteria: {list(operators.keys())}")
+            return np.array([False] * self.n_spectra)
+        left_mag = self.color_mag[:, {'g': 0, 'r': 1, 'z': 2, 'w1': 3, 'w2': 4}[left_color]]
+        right_mag = self.color_mag[:, {'g': 0, 'r': 1, 'z': 2, 'w1': 3, 'w2': 4}[right_color]]
+        criteria = operators[operator](left_mag - right_mag, float(val))
+        if exclude:
+            criteria = ~criteria
+        return criteria
+
+    def subtype_criteria(self, subtype='QSO', exclude=True):
+        subtype_dict = {
+            'QSO': 2,
+            'LRG': 0,
+            'ELG': 1,
+            'BGS': 60,
+            'MWS': 61,
+        }
+        if subtype.upper() not in subtype_dict:
+            print(f"Subtype '{subtype}' not recognized. Available subtypes: {list(subtype_dict.keys())}")
+            return np.array([False] * self.n_spectra)
+        
+        is_subtype = check_bits(self.targetID, subtype_dict[subtype.upper()])
+        if exclude:
+            is_subtype = ~is_subtype
+        return is_subtype
+
     #
     # Add label to the spectrum
     #
-    def add_label(self, i=None, label_type='QSO', label_at=None):
+    def add_label(self, label_type='QSO', criteria=None):
         """Add a label to the spectrum.
 
         Args:
@@ -241,43 +287,16 @@ class Spectrum:
             label_type (str, optional): Type of label to add. Defaults to 'QSO'.
             label_at (int, optional): Index to add the label at. Defaults to None. This is only used when label_type is uncategorized.
         """
-        if label_type in ['QSO', 'LRG', 'ELG', 'BGS', 'MWS']:
-            subtype_dict = {
-                'QSO': 2,
-                'LRG': 0,
-                'ELG': 1,
-                'BGS': 60,
-                'MWS': 61,
-            }
-            if i is not None:
-                is_subtype = check_bits(self.targetID[i], subtype_dict[label_type.upper()])
-                if is_subtype:
-                    self.target_label[i].append(label_type)
-            elif i is None:
-                is_subtype = check_bits(self.targetID, subtype_dict[label_type.upper()])
-                for j in range(self.n_spectra):
-                    if is_subtype[j]:
-                        self.target_label[j].append(label_type)
-        elif label_type in list(lines_air.keys()):
-            is_line_detected = label_type in self.line_detections[i]
-            if is_line_detected:
-                self.target_label[i].append(label_type)
-        else:
-            self.target_label[label_at].append(label_type)
+        self.target_label[criteria].append(label_type)
 
-    def clean_label(self, i=None, label=None):
-        if (i is None) and (label is None):
+    def clean_label(self, label=None):
+        if (label is None):
             self.target_label = [[] for _ in range(self.n_spectra)]
-        elif (i is not None) and (label is None):
-            self.target_label[i] = []
-        elif (i is None) and (label is not None):
+        elif (label is not None):
             for j in range(self.n_spectra):
                 if label in self.target_label[j]:
                     self.target_label[j].remove(label)
-        elif (i is not None) and (label is not None):
-            if label in self.target_label[i]:
-                self.target_label[i].remove(label)
-    
+
     def label_filter(self, label=['QSO', 'NaD'], exclude=True):
         
         if label is None:
@@ -285,7 +304,7 @@ class Spectrum:
             print("Available labels: ", ['QSO', 'LRG', 'ELG', 'BGS', 'MWS'] + list(lines_air.keys()))
             print("Dataset remains unfiltered.")
             return
-        elif any(lbl not in ['QSO', 'LRG', 'ELG', 'BGS', 'MWS', 'test'] + list(lines_air.keys()) for lbl in label):
+        elif any(lbl not in ['QSO', 'LRG', 'ELG', 'BGS', 'MWS'] + list(lines_air.keys()) for lbl in label):
             print(f"Label '{label}' not recognized. Available labels: {['QSO', 'LRG', 'ELG', 'BGS', 'MWS'] + list(lines_air.keys())}")
             print("Dataset remains unfiltered.")
             return
@@ -293,31 +312,29 @@ class Spectrum:
         is_label = []
         for i in range(self.n_spectra):
             is_label.append(all(lbl in self.target_label[i] for lbl in label))
-            
+
+        is_label = np.array(is_label)
         if exclude:
-            self.n_spectra      = len(self.targetID[~is_label])
-            self.targetID       = self.targetID[~is_label]
-            self.z_pipe         = self.z_pipe[~is_label]
-            self.RA             = self.RA[~is_label]
-            self.DEC            = self.DEC[~is_label]
-            self.coadd_data     = self.coadd_data[~is_label][:]
-            self.ivar           = self.ivar[~is_label][:]
-            self.mask           = self.mask[~is_label][:]
-            self.target_label   = [lbls for j, lbls in enumerate(self.target_label) if not is_label[j]]
-            self.line_detections= [lbls for j, lbls in enumerate(self.line_detections) if not is_label[j]]
-            self.subtype        += f" w/o {label}"
-        else:
-            self.n_spectra      = len(self.targetID[is_label])
-            self.targetID       = self.targetID[is_label]
-            self.z_pipe         = self.z_pipe[is_label]
-            self.RA             = self.RA[is_label]
-            self.DEC            = self.DEC[is_label]
-            self.coadd_data     = self.coadd_data[is_label][:]
-            self.ivar           = self.ivar[is_label][:]
-            self.mask           = self.mask[is_label][:]
-            self.target_label   = [lbls for j, lbls in enumerate(self.target_label) if is_label[j]]
-            self.line_detections= [lbls for j, lbls in enumerate(self.line_detections) if is_label[j]]
+            is_label = ~is_label
+            
+        self.n_spectra      = len(self.targetID[is_label])
+        self.targetID       = self.targetID[is_label]
+        self.z_pipe         = self.z_pipe[is_label]
+        self.z              = self.z[is_label]
+        self.RA             = self.RA[is_label]
+        self.DEC            = self.DEC[is_label]
+        self.coadd_data     = self.coadd_data[is_label][:]
+        self.ivar           = self.ivar[is_label][:]
+        self.mask           = self.mask[is_label][:]
+        self.target_label   = [lbls for j, lbls in enumerate(self.target_label) if is_label[j]]
+        self.line_detections= [lbls for j, lbls in enumerate(self.line_detections) if is_label[j]]
     
+    def subset(self, include=['QSO', 'blue']):
+        if not include:
+            print("Please specify at least one label to include.")
+            return
+        
+
     #
     # Mask the bad pixels in the spectrum
     #
@@ -332,8 +349,6 @@ class Spectrum:
             self.coadd_data[~good] = np.nan
             self.ivar[~good] = np.nan
             self.smoothed_flux[~good] = np.nan
-
-    
 
     #
     # Fit spectrum
@@ -571,7 +586,7 @@ class Spectrum:
             
             
             popt = self.fit_flux(i=i, fitting_model=model, lam0=fit_line, region=region, fit_z=True, two_component=two_comp)
-            if popt is None:
+            if (popt is None) or (np.abs(popt[0])<1e-4):
                 if use_mode != 'auto':
                     return get_dz_new(fit_z_mode='no')
                 else:
