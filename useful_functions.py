@@ -279,7 +279,7 @@ class Spectrum:
     #
     # Add label to the spectrum
     #
-    def add_label(self, label_type='QSO', criteria=None):
+    def add_label(self, label_type='QSO', criteria=None, i=None):
         """Add a label to the spectrum.
 
         Args:
@@ -287,7 +287,10 @@ class Spectrum:
             label_type (str, optional): Type of label to add. Defaults to 'QSO'.
             label_at (int, optional): Index to add the label at. Defaults to None. This is only used when label_type is uncategorized.
         """
-        self.target_label[criteria].append(label_type)
+        if i is not None:
+            self.target_label[i].append(label_type)
+        elif criteria is not None:
+            self.target_label[criteria].append(label_type)
 
     def clean_label(self, label=None):
         if (label is None):
@@ -329,10 +332,18 @@ class Spectrum:
         self.target_label   = [lbls for j, lbls in enumerate(self.target_label) if is_label[j]]
         self.line_detections= [lbls for j, lbls in enumerate(self.line_detections) if is_label[j]]
     
-    def subset(self, include=['QSO', 'blue']):
-        if not include:
-            print("Please specify at least one label to include.")
-            return
+    def subset(self, criteria):
+        self.n_spectra      = len(self.targetID[criteria])
+        self.targetID       = self.targetID[criteria]
+        self.z_pipe         = self.z_pipe[criteria]
+        self.z              = self.z[criteria]
+        self.RA             = self.RA[criteria]
+        self.DEC            = self.DEC[criteria]
+        self.coadd_data     = self.coadd_data[criteria][:]
+        self.ivar           = self.ivar[criteria][:]
+        self.mask           = self.mask[criteria][:]
+        self.target_label   = [lbls for j, lbls in enumerate(self.target_label) if criteria[j]]
+        self.line_detections= [lbls for j, lbls in enumerate(self.line_detections) if criteria[j]]
         
 
     #
@@ -361,7 +372,8 @@ class Spectrum:
                  fit_z=True,
                  two_component=False, 
                  record_detection=None,
-                 e_or_a='e'):
+                 e_or_a='e',
+                 dz0=False):
 
         ##############################
         """
@@ -377,35 +389,43 @@ class Spectrum:
         if two_component:
             lam0 = lam0 + lam0 # duplicate to generate free components
         
-        self.fit_params = [[] for _ in range(self.n_spectra)]
         ##############################
         
         def fitting_func(lam, *params):
             gaussian_parms = []
             if fit_z:
-                dz = params[0]
+                dz, sigma_1 = params[0], params[1]
+                if two_component:
+                    sigma_2 = params[2]
+                    
                 for j in range(len(lam0)):
                     if two_component:
-                        dlam = params[-3]
-                        amp_j, sigma_j = params[2*j+1], params[2*j+2]
+                        amp_j, sigma_j = params[j+3], sigma_1
                         lam0_j = lam0[j] * (1 + z + dz) # fixed components
+                        
                         if j >= len(lam0)//2:
+                            dlam = params[-3]
+                            amp_j, sigma_j = params[j+3], sigma_2
                             lam0_j = (lam0[j]+dlam) * (1 + z + dz) # free components
                     else:
-                        amp_j, sigma_j = params[2*j+1], params[2*j + 2]
+                        amp_j, sigma_j = params[j+2], sigma_1
                         lam0_j = lam0[j] * (1 + z + dz)
                     gaussian_parms.append((amp_j, lam0_j, sigma_j))
             else:
+                sigma_1 = params[0]
+                if two_component:
+                    sigma_2 = params[1]
                 for j in range(len(lam0)):
                     if two_component:
-                        dlam = params[-3]
-                        amp_j, sigma_j = params[2*j], params[2*j + 1]
+                        amp_j, sigma_j = params[j+2], sigma_1
                         lam0_j = lam0[j] * (1 + z) # fixed components
                         if j >= len(lam0)//2:
+                            dlam = params[-3]
+                            amp_j, sigma_j = params[j+2], sigma_2
                             lam0_j = (lam0[j]+dlam) * (1 + z) # free components
                     else:
                         offset = params[-3] # system offset
-                        amp_j, sigma_j = params[3*j], params[3*j + 2]
+                        amp_j, sigma_j = params[j+1], sigma_1
                         lam0_j = (lam0[j] + offset) * (1 + z)
 
                     gaussian_parms.append((amp_j, lam0_j, sigma_j))
@@ -438,107 +458,112 @@ class Spectrum:
             sigma = np.sqrt(1 / ivar)
 
             # Initial guess for parameters
-            p0 = []
-            if fit_z:
-                p0.append(0) # dz
-                for j in range(len(lam0)):
-                    p0.append(1) # amp
-                    p0.append(1)  # sigma
-                if two_component:
-                    p0.append(5) #dlam
-            else:
-                for j in range(len(lam0)):
-                    if e_or_a == 'e':
-                        p0.append(1)  # amp (positive for emission)
-                    else:
-                        p0.append(-1)  # amp
-                    p0.append(1)  # sigma
-                p0.append(0)  # dlam/offset
-            p0.extend([0.0,5.0])  # conti_a, conti_b
-            
-            # Bound
-            bounds_lower = []
-            bounds_upper = []
-            if fit_z:
-                bounds_lower.append(-0.01)  # dz lower bound
-                bounds_upper.append(+0.01)  # dz upper bound
-                for j in range(len(lam0)):
-                    bounds_lower.append(0) # Amp lower bound
-                    bounds_upper.append(+100) # Amp upper bound
-                    
-                    
-                    bounds_lower.append(2/(2*np.sqrt(2*np.log(2))))  # fwhm > 2
-                    bounds_upper.append(10/(2*np.sqrt(2*np.log(2)))) # fwhm < 10
-                if two_component:
-                    bounds_lower.append(-10)  # dlam lower bound
-                    bounds_upper.append(+10)  # dlam upper bound
-            else:
-                for j in range(len(lam0)):
-                    if e_or_a == 'e':
-                        bounds_lower.append(0) # Amp lower bound
-                        bounds_upper.append(np.inf)    # Amp upper bound
-                    elif e_or_a == 'a':
-                        bounds_lower.append(-np.inf) # Amp lower bound
-                        bounds_upper.append(0)    # Amp upper bound
-                    bounds_lower.append(2/(2*np.sqrt(2*np.log(2))))  # fwhm > 2
-                    bounds_upper.append(10/(2*np.sqrt(2*np.log(2)))) # fwhm < 10
-                bounds_lower.append(-6)  # dlam/offset lower bound
-                bounds_upper.append(+6)  # dlam/offset upper bound
-                
-            bounds_lower.extend([-np.inf, 0])  # conti_a, conti_b lower bounds
-            bounds_upper.extend([np.inf, np.inf])    # conti_a, conti_b upper bounds
-            
+    
+            conti_a_init, conti_b_init = 0.0, 5.0
+            conti_a_lower, conti_a_upper = -np.inf, np.inf
+            conti_b_lower, conti_b_upper = 0.0, np.inf
 
-            try:
-                popt, pcov = curve_fit(fitting_func, lam, flux, p0=p0, sigma=sigma, bounds=(bounds_lower, bounds_upper), absolute_sigma=True)
-                self.fit_params[i] = popt
-                if (record_detection is not None) and (fit_z is False):
-                    if two_component:
-                        fitted_model = model(lam, 
-                                    gaussian_parms=[(popt[2*k], lam0[k]*(1+z), popt[2*k+1]) for k in range(len(lam0)//2)]+\
-                                        [(popt[2*k+(len(lam0)//2)], (lam0[k]+popt[-3])*(1+z), popt[2*k+1+(len(lam0)//2)]) for k in range(len(lam0)//2)],
-                                    conti_parms=(popt[-2], popt[-1]))
-                    else:
-                        fitted_model = model(lam, 
-                                    gaussian_parms=[(popt[2*k], (lam0[k]+popt[-3])*(1+z), popt[2*k+1]) for k in range(len(lam0))],
-                                    conti_parms=(popt[-2], popt[-1]))
-                    noise = np.std(flux - fitted_model)
-                    
-                    if (record_detection == 'NaD') and (two_component is False):
-                        
-                        if (min(-popt[0], -popt[2]) > 3*noise) \
-                        and ((min(popt[1], popt[3]) > 2/(2*np.sqrt(2*np.log(2)))) and (max(popt[1], popt[3]) < 10/(2*np.sqrt(2*np.log(2))))):
-                            self.line_detections[i].append(record_detection)
-                    elif (record_detection == 'NaD') and (two_component is True):
-                        if (min(max(-popt[0], -popt[4]), max(-popt[2], -popt[6])) > 3*noise) \
-                        and ((min(popt[1], popt[5], popt[3], popt[7]) > 2/(2*np.sqrt(2*np.log(2)))) and (max(popt[1], popt[5], popt[3], popt[7]) < 10/(2*np.sqrt(2*np.log(2))))):
-                            self.line_detections[i].append(record_detection)
-                return popt
-            except Exception as e:
-                print(f"Error fitting flux for spectrum {self.targetID[i]}: {e}")
-                self.fit_params[i] = None
-                return None
+            if (fit_z is True) and (two_component is True):
+                """
+                base_2 or OII_2 model
+                len(p0) = 3 + n_fit_line * 2 + 3
+                """
+                
+                dz_init, dz_upper, dz_lower                 = 0, 0.01, -0.01
+                sigma_1_init, sigma_1_upper, sigma_1_lower  = 1, 10/(2*np.sqrt(2*np.log(2))), 2/(2*np.sqrt(2*np.log(2)))
+                sigma_2_init, sigma_2_upper, sigma_2_lower  = 1, 10/(2*np.sqrt(2*np.log(2))), 2/(2*np.sqrt(2*np.log(2)))
+                dlam_init, dlam_upper, dlam_lower           = 0, 10, -10
+                amp_init, amp_upper, amp_lower              = [1]*len(lam0), [np.inf]*len(lam0), [0]*len(lam0)
+                
+                p0 = [dz_init, sigma_1_init, sigma_2_init] + amp_init + [dlam_init, conti_a_init, conti_b_init]
+                bounds_lower = [dz_lower, sigma_1_lower, sigma_2_lower] + amp_lower + [dlam_lower, conti_a_lower, conti_b_lower]
+                bounds_upper = [dz_upper, sigma_1_upper, sigma_2_upper] + amp_upper + [dlam_upper, conti_a_upper, conti_b_upper]
+            
+            elif (fit_z is True) and (two_component is False):
+                """
+                base or OII model
+                len(p0) = 2 + n_fit_line + 2
+                """
+                dz_init, dz_upper, dz_lower                 = 0, 0.01, -0.01
+                sigma_1_init, sigma_1_upper, sigma_1_lower  = 1, 10/(2*np.sqrt(2*np.log(2))), 2/(2*np.sqrt(2*np.log(2)))
+                amp_init, amp_upper, amp_lower              = [1]*len(lam0), [np.inf]*len(lam0), [0]*len(lam0)
+                
+                p0 = [dz_init, sigma_1_init] + amp_init + [conti_a_init, conti_b_init]
+                bounds_lower = [dz_lower, sigma_1_lower] + amp_lower + [conti_a_lower, conti_b_lower]
+                bounds_upper = [dz_upper, sigma_1_upper] + amp_upper + [conti_a_upper, conti_b_upper]
+                
+            elif (fit_z is False) and (two_component is True):
+                """
+                Fit two components without redshift adjustment
+                len(p0) = 2 + n_fit_line * 2 + 3
+                """
+                sigma_1_init, sigma_1_upper, sigma_1_lower  = 1, 10/(2*np.sqrt(2*np.log(2))), 2/(2*np.sqrt(2*np.log(2)))
+                sigma_2_init, sigma_2_upper, sigma_2_lower  = 1, 10/(2*np.sqrt(2*np.log(2))), 2/(2*np.sqrt(2*np.log(2)))
+                dlam_init, dlam_upper, dlam_lower           = 0, 6, -6
+                if e_or_a == 'a':
+                    amp_init, amp_upper, amp_lower          = [-1]*len(lam0), [0]*len(lam0), [-np.inf]*len(lam0)
+                else:
+                    amp_init, amp_upper, amp_lower          = [1]*len(lam0), [np.inf]*len(lam0), [0]*len(lam0)
+                
+                p0 = [sigma_1_init, sigma_2_init] + amp_init + [dlam_init, conti_a_init, conti_b_init]
+                bounds_lower = [sigma_1_lower, sigma_2_lower] + amp_lower + [dlam_lower, conti_a_lower, conti_b_lower]
+                bounds_upper = [sigma_1_upper, sigma_2_upper] + amp_upper + [dlam_upper, conti_a_upper, conti_b_upper]
+            
+            elif (fit_z is False) and (two_component is False):
+                """
+                Fit one component without redshift adjustment
+                len(p0) = 1 + n_fit_line + 3
+                """
+                sigma_1_init, sigma_1_upper, sigma_1_lower  = 1, 10/(2*np.sqrt(2*np.log(2))), 2/(2*np.sqrt(2*np.log(2)))
+                offset_init, offset_upper, offset_lower     = 0, 6, -6
+                if e_or_a == 'a':
+                    amp_init, amp_upper, amp_lower          = [-1]*len(lam0), [0]*len(lam0), [-np.inf]*len(lam0)
+                else:
+                    amp_init, amp_upper, amp_lower          = [1]*len(lam0), [np.inf]*len(lam0), [0]*len(lam0)
+
+                p0 = [sigma_1_init] + amp_init + [offset_init, conti_a_init, conti_b_init]
+                bounds_lower = [sigma_1_lower] + amp_lower + [offset_lower, conti_a_lower, conti_b_lower]
+                bounds_upper = [sigma_1_upper] + amp_upper + [offset_upper, conti_a_upper, conti_b_upper]
+
+    
+            # try:
+            #     popt, pcov = curve_fit(fitting_func, lam, flux, p0=p0, sigma=sigma, bounds=(bounds_lower, bounds_upper), absolute_sigma=True)
+            #     if fit_z and (np.abs(popt[0])<1e-4):
+            #         print('Try without fit_z ...')
+            #         return self.fit_flux(i=i, fitting_model=fitting_model, lam0=lam0, region=region,
+            #                               fit_z=False, two_component=two_component, record_detection=record_detection,
+            #                               e_or_a=e_or_a, dz0=True)
+            #     if dz0:
+            #         popt = np.insert(popt, 0, 0)
+            #     return popt
+            # except Exception as e:
+            #     print(f"{self.targetID[i]} using fit_z {fit_z} and two_comp {two_component}: {e}")
+            #     try:
+            #         print('Try without fit_z ...')
+            #         return self.fit_flux(i=i, fitting_model=fitting_model, lam0=lam0, region=region,
+            #                               fit_z=False, two_component=two_component, record_detection=record_detection,
+            #                               e_or_a=e_or_a, dz0=True)
+
+            #     except Exception as e:
+            #         print(f"{self.targetID[i]} using fit_z False and two_comp {two_component}: {e}")
+            #         return None
+            
+            popt, pcov = curve_fit(fitting_func, lam, flux, p0=p0, sigma=sigma, bounds=(bounds_lower, bounds_upper), absolute_sigma=True)
+            if dz0:
+                popt = np.insert(popt, 0, 0)
+            if fit_z and (np.abs(popt[0])<1e-4):
+                print('Try without fit_z ...')
+                return self.fit_flux(i=i, lam0=lam0, fit_z=False, two_component=two_component, dz0=True)
+            return popt
+            
         elif i is None:
+            fit_params = [[] for _ in range(self.n_spectra)]
             for k in range(self.n_spectra):
                 popt = self.fit_flux(i=k, fitting_model=fitting_model, lam0=lam0, region=region, fit_z=fit_z)
-                self.fit_params[k] = popt
+                fit_params[k].append(popt)
+            return fit_params
 
-                if (record_detection is not None) and (self.fit_params[i] is not None) and (fit_z is False):
-                    self.fit_params[i] = popt
-                    fitted_model = model(lam, 
-                                gaussian_parms=[(popt[3*k], popt[3*k+1], popt[3*k+2]) for k in range(len(lam0))],
-                                conti_parms=(popt[-2], popt[-1]))
-                    noise = np.std(flux - fitted_model)
-                    count = 0
-                    for j in range(len(lam0)):
-                        if np.abs(popt[3*j]) > 3*noise:
-                            count += 1
-                    if count >= len(lam0)//2:
-                        self.line_detections[i].append(record_detection)
-        
     def adjust_z(self, i, mode='base_2'):
-        
-        # self.adjust_z_mode[i] = mode
         
         """
         Adjust redshift based on fitted dz with forbidden lines.
@@ -559,99 +584,95 @@ class Spectrum:
         OII_rest    = air2vac(lines_air['OII'])
         
         modes = {
-            'auto': ([*Halpha_rest, *NII_rest,*SII_rest], True),
-            'base_2': ([*Halpha_rest, *NII_rest,*SII_rest], True),
+            'base_2': ([*Halpha_rest, *NII_rest, *SII_rest], True),
+            'base': ([*Halpha_rest, *NII_rest, *SII_rest], False),
             'OII_2': ([*OII_rest], True),
-            'base': ([*Halpha_rest, *NII_rest,*SII_rest], False),
             'OII': ([*OII_rest], False),
-            'no': (0, 0),
         }
-        
-        
-        use_mode = mode
-        
-        def get_dz_new(fit_z_mode):
-            
-            current_mode = list(modes.keys()).index(fit_z_mode)
-            self.adjust_z_mode[i] = fit_z_mode
-            
-            if fit_z_mode == 'no':
-                self.adjust_z_mode[i] = 'no'
-                return 0
-            
-            fit_line, two_comp = modes[fit_z_mode]
-            
-            region = (np.min(fit_line)*(1+self.z_pipe[i])- 200, np.max(fit_line)*(1+self.z_pipe[i]) + 200)
 
-            
-            
+        def get_z(fit_line, two_comp):
+            region = (np.min(fit_line)*(1+self.z_pipe[i])- 200, np.max(fit_line)*(1+self.z_pipe[i]) + 200)
             popt = self.fit_flux(i=i, fitting_model=model, lam0=fit_line, region=region, fit_z=True, two_component=two_comp)
-            if (popt is None) or (np.abs(popt[0])<1e-4):
-                if use_mode != 'auto':
-                    return get_dz_new(fit_z_mode='no')
-                else:
-                    current_mode += 1
-                    self.adjust_z_mode[i] = list(modes.keys())[current_mode]
-                    return get_dz_new(fit_z_mode=list(modes.keys())[current_mode])
-            
-            
+
             lam = desi_wavelength.copy()
             flux = self.coadd_data[i]
-            ivar = self.ivar[i]
             mask = self.mask[i]
             
             crop_region = (lam >= region[0]) & (lam <= region[1])
             lam = lam[crop_region]
             flux = flux[crop_region]
-            ivar = ivar[crop_region]
             mask = mask[crop_region]
-            
             good = (mask == 0)
             lam = lam[good]
             flux = flux[good]
-            ivar = ivar[good]
-            sigma = np.sqrt(1 / ivar)
             
-            if two_comp:
-                fitted_model = model(lam, 
-                   gaussian_parms=\
-                        [(popt[2*k+1], fit_line[k]*(1+self.z_pipe[i]+(popt[0])), popt[2*k+2]) for k in range(len(fit_line))] +\
-                        [(popt[2*k+len(fit_line)+1], (fit_line[k]+popt[-3])*(1+self.z_pipe[i]+(popt[0])), popt[2*k+len(fit_line)+2]) for k in range(len(fit_line))],
-                    conti_parms=(popt[-2], popt[-1]))
+            if popt is not None:
+                if two_comp:
+                    dz, sigma_1, sigma_2, dlam, conti_a, conti_b = popt[0], popt[1], popt[2], popt[-3], popt[-2], popt[-1]
+                    z = self.z_pipe[i]
+                    fixed_comp = []
+                    free_comp  = []
+                    for k in range(len(fit_line)):
+                        fixed_comp.append((popt[k+3], fit_line[k]*(1+z+dz), sigma_1))
+                        free_comp.append((popt[(k+len(fit_line))+3], (fit_line[k]+dlam)*(1+z+dz), sigma_2))
+                    fitted_model = model(lam, gaussian_parms=(fixed_comp+free_comp), conti_parms=(conti_a, conti_b))
+                    
+                else:
+                    dz, sigma_1, conti_a, conti_b = popt[0], popt[1], popt[-2], popt[-1]
+                    z = self.z_pipe[i]
+                    offset_comp = []
+                    for k in range(len(fit_line)):
+                        offset_comp.append((popt[k+2], fit_line[k]*(1+z+dz), sigma_1))
+                    fitted_model = model(lam, gaussian_parms=offset_comp, conti_parms=(conti_a, conti_b))
+                    
                 noise = np.std(flux - fitted_model)
                 count = 0
                 for j in range(len(fit_line)):
-                    if max(popt[2*(j+len(fit_line))+1], popt[2*j+1]) > 3*noise:
-                        count += 1
-                if count >= (len(fit_line)//2):
-                    dz = popt[0]
-                    return dz
-                else:
-                    if use_mode != 'auto':
-                        return get_dz_new(fit_z_mode='no')
+                    if two_comp:
+                        if max(popt[(j+len(fit_line))+3], popt[j+3]) > 3*noise:
+                            count += 1
                     else:
-                        current_mode +=1
-                        self.adjust_z_mode[i] = list(modes.keys())[current_mode]
-                        return get_dz_new(fit_z_mode=list(modes.keys())[current_mode])
+                        if popt[j+2] > 3*noise:
+                            count += 1
+                            
+                    if count >= (len(fit_line)//2):
+                        return dz
+                    else:
+                        return 0
             else:
-                fitted_model = model(lam, 
-                        gaussian_parms=[(popt[2*k+1], fit_line[k]*(1+self.z_pipe[i]+(popt[0])), popt[2*k+2]) for k in range(len(fit_line))],
-                        conti_parms=(popt[-2], popt[-1]))
-                noise = np.std(flux - fitted_model)
-                count = 0
-                for j in range(len(fit_line)):
-                    if popt[2*j+1] > 3*noise:
-                        count += 1
-                if count >= len(fit_line)//2:
-                    dz = popt[0]
-                    return dz
-                else:
-                    if use_mode != 'auto':
-                        return get_dz_new(fit_z_mode='no')
-                    else:
-                        current_mode += 1
-                        self.adjust_z_mode[i] = list(modes.keys())[current_mode]
-                        return get_dz_new(fit_z_mode=list(modes.keys())[current_mode])
+                return 0
 
-        dz = get_dz_new(mode)
-        self.z[i] = self.z_pipe[i] + dz if dz is not None else self.z_pipe[i]
+
+        if mode == 'auto':
+            for using_mode in list(modes.keys()):
+                fit_line, two_comp = modes[using_mode]
+                dz = get_z(fit_line, two_comp)
+                mode = using_mode
+                if np.abs(dz) >= 1e-4:
+                    break
+            if (dz is None) or (np.abs(dz) < 1e-4):
+                mode = 'no'
+                dz = 0
+        elif mode == 'base_2' or mode == 'OII_2':
+            fit_line, two_comp = modes[mode]
+            dz = get_z(fit_line, two_comp)
+            if np.abs(dz) < 1e-4:
+                mode = mode.replace('_2', '')
+                fit_line, two_comp = modes[mode]
+                dz = get_z(fit_line, two_comp)
+                if np.abs(dz) < 1e-4:
+                    mode = 'no'
+                    dz = 0
+        elif mode == 'base' or mode == 'OII':
+            fit_line, two_comp = modes[mode]
+            dz = get_z(fit_line, two_comp)
+            if np.abs(dz) < 1e-4:
+                mode = 'no'
+                dz = 0
+                
+        elif mode == 'no':
+            dz = 0
+
+        self.adjust_z_mode[i] = mode
+        self.z[i] = self.z_pipe[i] + dz
+        return dz
