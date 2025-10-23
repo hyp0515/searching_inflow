@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 import warnings
 
-c = const.c.cgs.value * 1e-5  # speed of light in km/s
+c = const.c.cgs.value * 1e-4  # speed of light in km/s
 desi_wavelength = np.arange(3600, 9824 + .8, .8) # DESI's observe wavelength
 
 # https://astronomy.nmsu.edu/drewski/tableofemissionlines.html
@@ -185,6 +185,7 @@ class Spectrum:
         
         self.n_spectra      = len(spectra_data[1].data)
         self.adjust_z_mode   = [[] for _ in range(self.n_spectra)]
+        self.searched_NaD    = [[] for _ in range(self.n_spectra)]
         self.line_detections = [[] for _ in range(self.n_spectra)]
         self.target_label    = [[] for _ in range(self.n_spectra)]
         self.subtype        = 'Original'
@@ -232,7 +233,6 @@ class Spectrum:
     #
     # Color criteria
     #
-    
     def color_criteria(self, criterion='g-r>=0.85', exclude=True):
         operators = {
             '>=': lambda x, y: x >= y,
@@ -386,6 +386,7 @@ class Spectrum:
         ------------------------------
         If fit_z is True
         """
+        fit_line = lam0.copy()
         if two_component:
             lam0 = lam0 + lam0 # duplicate to generate free components
         
@@ -402,8 +403,8 @@ class Spectrum:
                     if two_component:
                         amp_j, sigma_j = params[j+3], sigma_1
                         lam0_j = lam0[j] * (1 + z + dz) # fixed components
-                        
-                        if j >= len(lam0)//2:
+
+                        if j >= len(fit_line):
                             dlam = params[-3]
                             amp_j, sigma_j = params[j+3], sigma_2
                             lam0_j = (lam0[j]+dlam) * (1 + z + dz) # free components
@@ -419,7 +420,7 @@ class Spectrum:
                     if two_component:
                         amp_j, sigma_j = params[j+2], sigma_1
                         lam0_j = lam0[j] * (1 + z) # fixed components
-                        if j >= len(lam0)//2:
+                        if j >= len(fit_line):
                             dlam = params[-3]
                             amp_j, sigma_j = params[j+2], sigma_2
                             lam0_j = (lam0[j]+dlam) * (1 + z) # free components
@@ -549,11 +550,7 @@ class Spectrum:
             #         return None
             
             popt, pcov = curve_fit(fitting_func, lam, flux, p0=p0, sigma=sigma, bounds=(bounds_lower, bounds_upper), absolute_sigma=True)
-            if dz0:
-                popt = np.insert(popt, 0, 0)
-            if fit_z and (np.abs(popt[0])<1e-4):
-                print('Try without fit_z ...')
-                return self.fit_flux(i=i, lam0=lam0, fit_z=False, two_component=two_component, dz0=True)
+            
             return popt
             
         elif i is None:
@@ -592,7 +589,12 @@ class Spectrum:
 
         def get_z(fit_line, two_comp):
             region = (np.min(fit_line)*(1+self.z_pipe[i])- 200, np.max(fit_line)*(1+self.z_pipe[i]) + 200)
-            popt = self.fit_flux(i=i, fitting_model=model, lam0=fit_line, region=region, fit_z=True, two_component=two_comp)
+            try:
+                popt = self.fit_flux(i=i, fitting_model=model, lam0=fit_line, region=region, fit_z=True, two_component=two_comp)
+
+            except Exception as e:
+                print(f"Error fitting flux for {self.targetID[i]}: {e}")
+                return 0
 
             lam = desi_wavelength.copy()
             flux = self.coadd_data[i]
@@ -609,6 +611,8 @@ class Spectrum:
             if popt is not None:
                 if two_comp:
                     dz, sigma_1, sigma_2, dlam, conti_a, conti_b = popt[0], popt[1], popt[2], popt[-3], popt[-2], popt[-1]
+                    if (np.abs(dlam) < 0.8) and (np.abs(dz) < 1e-4):
+                        return 0
                     z = self.z_pipe[i]
                     fixed_comp = []
                     free_comp  = []
@@ -619,6 +623,8 @@ class Spectrum:
                     
                 else:
                     dz, sigma_1, conti_a, conti_b = popt[0], popt[1], popt[-2], popt[-1]
+                    if (np.abs(dz) < 1e-4):
+                        return 0
                     z = self.z_pipe[i]
                     offset_comp = []
                     for k in range(len(fit_line)):
@@ -631,11 +637,16 @@ class Spectrum:
                     if two_comp:
                         if max(popt[(j+len(fit_line))+3], popt[j+3]) > 3*noise:
                             count += 1
+                        
                     else:
                         if popt[j+2] > 3*noise:
                             count += 1
                             
-                    if count >= (len(fit_line)//2):
+                        # if count >= (len(fit_line)//2):
+                        #     return dz
+                        # else:
+                        #     return 0
+                    if count >= (len(fit_line)//3):
                         return dz
                     else:
                         return 0
@@ -676,3 +687,86 @@ class Spectrum:
         self.adjust_z_mode[i] = mode
         self.z[i] = self.z_pipe[i] + dz
         return dz
+    
+    def search_NaD(self, i, two_component=True):
+
+        NaD_rest = air2vac(lines_air['NaD'])
+
+        region = (np.min(NaD_rest)*(1+self.z_pipe[i])- 200, np.max(NaD_rest)*(1+self.z_pipe[i]) + 200)
+        
+        lam = desi_wavelength.copy()
+        flux = self.coadd_data[i]
+        mask = self.mask[i]
+        crop_region = (lam >= region[0]) & (lam <= region[1])
+        lam = lam[crop_region]
+        flux = flux[crop_region]
+        mask = mask[crop_region]
+        good = (mask == 0)
+        lam = lam[good]
+        flux = flux[good]
+        
+        z = self.z[i]
+        
+        if two_component:
+            try:
+                popt = self.fit_flux(i=i, fitting_model=model, lam0=[*NaD_rest], region=region, fit_z=False, two_component=True, e_or_a='a')
+                sigma_1, sigma_2, dlam, conti_a, conti_b = popt[0], popt[1], popt[-3], popt[-2], popt[-1]
+                amp_D1, amp_D2 = popt[2], popt[3]
+                amp_D1_free, amp_D2_free = popt[4], popt[5]
+                if np.abs(dlam) < 0.8:
+                    # print(f"Small dlam in two-component fit for NaD in {self.targetID[i]}, trying one-component fit.")
+                    return self.search_NaD(i=i, two_component=False)
+                
+                fixed_comp = [(amp_D1, NaD_rest[0]*(1+z), sigma_1), (amp_D2, NaD_rest[1]*(1+z), sigma_1)]
+                free_comp  = [(amp_D1_free, (NaD_rest[0]+dlam)*(1+z), sigma_2), (amp_D2_free, (NaD_rest[1]+dlam)*(1+z), sigma_2)]
+                
+                fitted_model = model(lam, gaussian_parms=(fixed_comp+free_comp), conti_parms=(conti_a, conti_b))
+                noise = np.std(flux - fitted_model)
+                
+                # count = 0
+                # for j in range(len(NaD_rest)):
+                #     if min(max(popt[1], popt[3]), max(popt[2], popt[4])) > 3*noise:
+                #         count += 1
+                if min(max(np.abs(amp_D1), np.abs(amp_D1_free)), max(np.abs(amp_D2), np.abs(amp_D2_free))) > 3*noise:
+                    if dlam > 0.8:
+                        self.searched_NaD[i] = 'inflow_2'
+                    elif dlam < -0.8:
+                        self.searched_NaD[i] = 'outflow_2'
+                    else:
+                        self.searched_NaD[i] = 'systemic_2'
+                    return popt
+                else:
+                    # print(f"Insufficient detection in two-component fit for NaD in {self.targetID[i]}, trying one-component fit.")
+                    return self.search_NaD(i=i, two_component=False)
+            except:
+                # print(f"Two-component fit failed for NaD in {self.targetID[i]}, trying one-component fit.")
+                return self.search_NaD(i=i, two_component=False)
+        else:
+            try:
+                popt = self.fit_flux(i=i, fitting_model=model, lam0=[*NaD_rest], region=region, fit_z=False, two_component=False, e_or_a='a')
+                sigma_1, offset, conti_a, conti_b = popt[0], popt[-3], popt[-2], popt[-1]
+                amp_D1, amp_D2 = popt[1], popt[2]
+                
+                offset_comp = [(amp_D1, (NaD_rest[0]+offset)*(1+z), sigma_1), (amp_D2, (NaD_rest[1]+offset)*(1+z), sigma_1)]
+                fitted_model = model(lam, gaussian_parms=offset_comp, conti_parms=(conti_a, conti_b))
+                noise = np.std(flux - fitted_model)
+                
+                # count = 0
+                # for j in range(len(NaD_rest)):
+                #     if popt[j+1] > 3*noise:
+                #         count += 1
+                if min(np.abs(amp_D1), np.abs(amp_D2)) > 3*noise:
+                    if offset > 0.8:
+                        self.searched_NaD[i] = 'inflow'
+                    elif offset < -0.8:
+                        self.searched_NaD[i] = 'outflow'
+                    else:
+                        self.searched_NaD[i] = 'systemic'
+                    return popt
+                else:
+                    self.searched_NaD[i] = 'no_detection'
+                    return None
+            except Exception as e:
+                print(f"Error occurred while searching NaD for {self.targetID[i]}: {e}")
+                self.searched_NaD[i] = 'no_detection'
+                return None
