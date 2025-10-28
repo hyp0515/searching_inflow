@@ -1,11 +1,14 @@
 import numpy as np
+import matplotlib.pyplot as plt
 import astropy.constants as const
 from scipy.ndimage import gaussian_filter1d
 from scipy.optimize import curve_fit
 import requests
-import json
 from pathlib import Path
 import warnings
+from multiprocessing import Pool, cpu_count
+import functools
+import tqdm
 
 c = const.c.cgs.value * 1e-4  # speed of light in km/s
 desi_wavelength = np.arange(3600, 9824 + .8, .8) # DESI's observe wavelength
@@ -20,6 +23,7 @@ lines_air = {
     'NII': [6548.050, 6583.460],
     'CaII': [8498.020, 8542.090, 8662.140],
     'NaD': [5890.004, 5895.985],
+    'HeI': [5875.624]
 }
 
 def air2vac(wave):
@@ -39,6 +43,8 @@ def air2vac(wave):
     sigma2 = (1e4 / wave) ** 2  # Convert to microns^-2
     factor = 1 + 0.0000834254 + (0.02406147 / (130 - sigma2)) + (0.00015998 / (38.9 - sigma2))
     return wave * factor
+
+lines_vac = {key: air2vac(np.array(value)) for key, value in lines_air.items()}
 
 def vac2air(wave):
     """
@@ -76,21 +82,6 @@ def lam2vel(lam, lam0, z):
     """
     resting_lam = lam / (1 + z)
     return c * (resting_lam - lam0) / lam0
-
-def check_bits(ID, bit):
-    """
-    Target bits from DESI:
-    1. BGS: bit 60
-    2. LRG: bit 0
-    3. ELG: bit 1
-    4. QSO: bit 2
-    5. MWS: bit 61
-    6. Secondary Targets: bit 62
-    """
-    
-    val = (2**bit)
-    res = ID & val != 0
-    return (res)
 
 def smooth_spectrum(flux, sigma):
     """
@@ -143,17 +134,15 @@ def image_link(RA, DEC, save_image=False, fname=None):
 def spectrum_link(targetID):
     return f'https://www.legacysurvey.org/viewer/desi-spectrum/dr1/targetid{targetID}'
 
-def chisq(observed, model, ivar):
-    sigma = np.sqrt(1 / ivar)
-    residuals = observed - model
-    chi_squared = np.sum((residuals ** 2) / (sigma ** 2))
-    return chi_squared
 
 ################################################################################################################
 class Spectrum:
-    
+
     def __init__(self, spectra_data, color_data):
         
+        
+        
+        # Match target IDs between spectra and color catalogs
         targetID_spectra = spectra_data[1].data[:]['TARGETID'] # spectra catalog has 100638 spectra
         targetID_color    = color_data[1].data[:]['TARGETID'] # color catalog has 100642 spectra
         rearranged_indices = np.searchsorted(targetID_color, targetID_spectra)
@@ -164,21 +153,19 @@ class Spectrum:
         self.z              = self.z_pipe.copy()
         self.RA             = spectra_data[1].data['RA']
         self.DEC            = spectra_data[1].data['DEC']
-        
-        coadd_data          = spectra_data[2].data
-        self.coadd_data     = np.take(coadd_data, 0, axis=1)
-        ivar                = spectra_data[3].data
-        self.ivar           = np.take(ivar, 0, axis=1)
-        mask                = spectra_data[4].data
-        self.mask           = np.take(mask, 0, axis=1)
 
+        self.coadd_data     = np.take(spectra_data[2].data, 0, axis=1)
+        self.ivar           = np.take(spectra_data[3].data, 0, axis=1)
+        self.mask           = np.take(spectra_data[4].data, 0, axis=1)
+
+        self.spectype      = color_data[1].data['SPECTYPE'][rearranged_indices]
+        
         g_flux = color_data[1].data['FLUX_G']
         r_flux = color_data[1].data['FLUX_R']
         z_flux = color_data[1].data['FLUX_Z']
         w1_flux = color_data[1].data['FLUX_W1']
         w2_flux = color_data[1].data['FLUX_W2']
         color_flux = np.vstack([g_flux, r_flux, z_flux, w1_flux, w2_flux]).T
-        
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=RuntimeWarning)
             self.color_mag = (22.5 - 2.5 * np.log10(color_flux))[rearranged_indices, :]
@@ -186,20 +173,8 @@ class Spectrum:
         self.n_spectra      = len(spectra_data[1].data)
         self.adjust_z_mode   = [[] for _ in range(self.n_spectra)]
         self.searched_NaD    = [[] for _ in range(self.n_spectra)]
-        self.line_detections = [[] for _ in range(self.n_spectra)]
         self.target_label    = [[] for _ in range(self.n_spectra)]
-        self.subtype        = 'Original'
         self.smoothed_flux = smooth_spectrum(self.coadd_data, sigma=1)
-        
-    def add_attributes(self, attr_names, attr_values):
-        for name, value in zip(attr_names, attr_values):
-            setattr(self, name, value)
-
-    def del_attributes(self, attr_name):
-        if hasattr(self, attr_name):
-            delattr(self, attr_name)
-        else:
-            print(f"Attribute '{attr_name}' not found.")
     
     def shrink_dataset(self, indices):
         self.n_spectra      = len(self.targetID[::indices])
@@ -213,9 +188,7 @@ class Spectrum:
         self.mask           = self.mask[::indices]
         self.color_mag      = self.color_mag[::indices]
         self.smoothed_flux  = self.smoothed_flux[::indices]
-        self.target_label   = self.target_label[::indices]
-        self.line_detections= self.line_detections[::indices]
-    
+
     #
     # Translate targetID to index
     #
@@ -229,7 +202,7 @@ class Spectrum:
         except IndexError:
             print(f"targetID {targetID} not found in the dataset.")
             return None
-        
+    
     #
     # Color criteria
     #
@@ -260,18 +233,17 @@ class Spectrum:
         return criteria
 
     def subtype_criteria(self, subtype='QSO', exclude=True):
-        subtype_dict = {
-            'QSO': 2,
-            'LRG': 0,
-            'ELG': 1,
-            'BGS': 60,
-            'MWS': 61,
-        }
-        if subtype.upper() not in subtype_dict:
-            print(f"Subtype '{subtype}' not recognized. Available subtypes: {list(subtype_dict.keys())}")
+        
+        if subtype.upper() not in ['QSO', 'LRG', 'ELG', 'BGS', 'MWS']:
+            print(f"Subtype '{subtype}' not recognized. Available subtypes: ['QSO', 'LRG', 'ELG', 'BGS', 'MWS']")
             return np.array([False] * self.n_spectra)
         
-        is_subtype = check_bits(self.targetID, subtype_dict[subtype.upper()])
+        # simple vectorized comparison
+        is_subtype = (self.spectype == subtype.upper())
+
+        # # or explicitly with numpy
+        # is_subtype = np.equal(self.spectype, subtype.upper())
+
         if exclude:
             is_subtype = ~is_subtype
         return is_subtype
@@ -330,7 +302,6 @@ class Spectrum:
         self.ivar           = self.ivar[is_label][:]
         self.mask           = self.mask[is_label][:]
         self.target_label   = [lbls for j, lbls in enumerate(self.target_label) if is_label[j]]
-        self.line_detections= [lbls for j, lbls in enumerate(self.line_detections) if is_label[j]]
     
     def subset(self, criteria):
         self.n_spectra      = len(self.targetID[criteria])
@@ -342,25 +313,25 @@ class Spectrum:
         self.coadd_data     = self.coadd_data[criteria][:]
         self.ivar           = self.ivar[criteria][:]
         self.mask           = self.mask[criteria][:]
-        self.target_label   = [lbls for j, lbls in enumerate(self.target_label) if criteria[j]]
-        self.line_detections= [lbls for j, lbls in enumerate(self.line_detections) if criteria[j]]
         
 
-    #
-    # Mask the bad pixels in the spectrum
-    #
-    def mask_spectrum(self, i=None):
-        if i is not None:
-            good = (self.mask[i] == 0)
-            self.coadd_data[i][~good] = np.nan
-            self.ivar[i][~good] = np.nan
-            self.smoothed_flux[i][~good] = np.nan
-        else:
-            good = (self.mask == 0)
-            self.coadd_data[~good] = np.nan
-            self.ivar[~good] = np.nan
-            self.smoothed_flux[~good] = np.nan
-
+class FitSpectrum:
+    def __init__(self, data_class:Spectrum):
+        self.n_spectra     = data_class.n_spectra
+        self.targetID      = data_class.targetID
+        self.z_pipe        = data_class.z_pipe
+        self.z             = data_class.z
+        self.RA            = data_class.RA
+        self.DEC           = data_class.DEC
+        self.coadd_data    = data_class.coadd_data
+        self.ivar          = data_class.ivar
+        self.mask          = data_class.mask
+        self.target_label  = data_class.target_label
+        self.adjust_z_mode = data_class.adjust_z_mode
+        self.searched_NaD  = data_class.searched_NaD
+        self.spectype      = data_class.spectype
+        self.color_mag     = data_class.color_mag
+        self.id2index      = data_class.id2index
     #
     # Fit spectrum
     #    
@@ -371,9 +342,7 @@ class Spectrum:
                  region=None, 
                  fit_z=True,
                  two_component=False, 
-                 record_detection=None,
-                 e_or_a='e',
-                 dz0=False):
+                 e_or_a='e',):
 
         ##############################
         """
@@ -444,7 +413,7 @@ class Spectrum:
             z = self.z[i]
             
             if region is None:
-                region = (np.min(lam0)*(1+z)- 200, np.max(lam0)*(1+z) + 200)
+                region = (np.min(lam0)*(1+z)- 50, np.max(lam0)*(1+z) + 50)
 
             crop_region = (lam >= region[0]) & (lam <= region[1])
             lam = lam[crop_region]
@@ -460,7 +429,7 @@ class Spectrum:
 
             # Initial guess for parameters
     
-            conti_a_init, conti_b_init = 0.0, 5.0
+            conti_a_init, conti_b_init = 0.0, 0.0
             conti_a_lower, conti_a_upper = -np.inf, np.inf
             conti_b_lower, conti_b_upper = 0.0, np.inf
 
@@ -526,38 +495,18 @@ class Spectrum:
                 bounds_lower = [sigma_1_lower] + amp_lower + [offset_lower, conti_a_lower, conti_b_lower]
                 bounds_upper = [sigma_1_upper] + amp_upper + [offset_upper, conti_a_upper, conti_b_upper]
 
-    
-            # try:
-            #     popt, pcov = curve_fit(fitting_func, lam, flux, p0=p0, sigma=sigma, bounds=(bounds_lower, bounds_upper), absolute_sigma=True)
-            #     if fit_z and (np.abs(popt[0])<1e-4):
-            #         print('Try without fit_z ...')
-            #         return self.fit_flux(i=i, fitting_model=fitting_model, lam0=lam0, region=region,
-            #                               fit_z=False, two_component=two_component, record_detection=record_detection,
-            #                               e_or_a=e_or_a, dz0=True)
-            #     if dz0:
-            #         popt = np.insert(popt, 0, 0)
-            #     return popt
-            # except Exception as e:
-            #     print(f"{self.targetID[i]} using fit_z {fit_z} and two_comp {two_component}: {e}")
-            #     try:
-            #         print('Try without fit_z ...')
-            #         return self.fit_flux(i=i, fitting_model=fitting_model, lam0=lam0, region=region,
-            #                               fit_z=False, two_component=two_component, record_detection=record_detection,
-            #                               e_or_a=e_or_a, dz0=True)
+            try:
+                popt, pcov = curve_fit(fitting_func, lam, flux, p0=p0, sigma=sigma, bounds=(bounds_lower, bounds_upper), absolute_sigma=True)
+            except:
+                popt = None
 
-            #     except Exception as e:
-            #         print(f"{self.targetID[i]} using fit_z False and two_comp {two_component}: {e}")
-            #         return None
-            
-            popt, pcov = curve_fit(fitting_func, lam, flux, p0=p0, sigma=sigma, bounds=(bounds_lower, bounds_upper), absolute_sigma=True)
-            
             return popt
             
         elif i is None:
             fit_params = [[] for _ in range(self.n_spectra)]
             for k in range(self.n_spectra):
                 popt = self.fit_flux(i=k, fitting_model=fitting_model, lam0=lam0, region=region, fit_z=fit_z)
-                fit_params[k].append(popt)
+                fit_params[k] = popt
             return fit_params
 
     def adjust_z(self, i, mode='base_2'):
@@ -575,11 +524,11 @@ class Spectrum:
         
         """
         
-        Halpha_rest = air2vac(lines_air['Halpha'])
-        NII_rest    = air2vac(lines_air['NII'])
-        SII_rest    = air2vac(lines_air['SII'])
-        OII_rest    = air2vac(lines_air['OII'])
-        
+        Halpha_rest = lines_vac['Halpha']
+        NII_rest    = lines_vac['NII']
+        SII_rest    = lines_vac['SII']
+        OII_rest    = lines_vac['OII']
+
         modes = {
             'base_2': ([*Halpha_rest, *NII_rest, *SII_rest], True),
             'base': ([*Halpha_rest, *NII_rest, *SII_rest], False),
@@ -588,7 +537,7 @@ class Spectrum:
         }
 
         def get_z(fit_line, two_comp):
-            region = (np.min(fit_line)*(1+self.z_pipe[i])- 200, np.max(fit_line)*(1+self.z_pipe[i]) + 200)
+            region = (np.min(fit_line)*(1+self.z_pipe[i])- 50, np.max(fit_line)*(1+self.z_pipe[i]) + 50)
             try:
                 popt = self.fit_flux(i=i, fitting_model=model, lam0=fit_line, region=region, fit_z=True, two_component=two_comp)
 
@@ -635,17 +584,13 @@ class Spectrum:
                 count = 0
                 for j in range(len(fit_line)):
                     if two_comp:
-                        if max(popt[(j+len(fit_line))+3], popt[j+3]) > 3*noise:
+                        if min(popt[(j+len(fit_line))+3], popt[j+3]) > 3*noise:
                             count += 1
                         
                     else:
                         if popt[j+2] > 3*noise:
                             count += 1
                             
-                        # if count >= (len(fit_line)//2):
-                        #     return dz
-                        # else:
-                        #     return 0
                     if count >= (len(fit_line)//3):
                         return dz
                     else:
@@ -690,9 +635,9 @@ class Spectrum:
     
     def search_NaD(self, i, two_component=True):
 
-        NaD_rest = air2vac(lines_air['NaD'])
+        NaD_rest = lines_vac['NaD']
 
-        region = (np.min(NaD_rest)*(1+self.z_pipe[i])- 200, np.max(NaD_rest)*(1+self.z_pipe[i]) + 200)
+        region = (np.min(NaD_rest)*(1+self.z_pipe[i])- 50, np.max(NaD_rest)*(1+self.z_pipe[i]) + 50)
         
         lam = desi_wavelength.copy()
         flux = self.coadd_data[i]
@@ -727,7 +672,7 @@ class Spectrum:
                 # for j in range(len(NaD_rest)):
                 #     if min(max(popt[1], popt[3]), max(popt[2], popt[4])) > 3*noise:
                 #         count += 1
-                if min(max(np.abs(amp_D1), np.abs(amp_D1_free)), max(np.abs(amp_D2), np.abs(amp_D2_free))) > 3*noise:
+                if min(min(np.abs(amp_D1), np.abs(amp_D1_free)), min(np.abs(amp_D2), np.abs(amp_D2_free))) > 3*noise:
                     if dlam > 0.8:
                         self.searched_NaD[i] = 'inflow_2'
                     elif dlam < -0.8:
@@ -736,7 +681,6 @@ class Spectrum:
                         self.searched_NaD[i] = 'systemic_2'
                     return popt
                 else:
-                    # print(f"Insufficient detection in two-component fit for NaD in {self.targetID[i]}, trying one-component fit.")
                     return self.search_NaD(i=i, two_component=False)
             except:
                 # print(f"Two-component fit failed for NaD in {self.targetID[i]}, trying one-component fit.")
@@ -770,3 +714,112 @@ class Spectrum:
                 print(f"Error occurred while searching NaD for {self.targetID[i]}: {e}")
                 self.searched_NaD[i] = 'no_detection'
                 return None
+
+class PlotSpectrum:
+    def __init__(self, data_class:Spectrum):
+        self.n_spectra     = data_class.n_spectra
+        self.targetID      = data_class.targetID
+        self.z_pipe        = data_class.z_pipe
+        self.z             = data_class.z
+        self.RA            = data_class.RA
+        self.DEC           = data_class.DEC
+        self.coadd_data    = data_class.coadd_data
+        self.ivar          = data_class.ivar
+        self.mask          = data_class.mask
+        self.target_label  = data_class.target_label
+        self.spectype      = data_class.spectype
+        self.color_mag     = data_class.color_mag
+
+    def hist_color(self, x='g-z', show=True, save=True, fname=None, **kwargs):
+        if '-' in x:
+            left_color, right_color = x.split('-')
+            left_mag = self.color_mag[:, {'g': 0, 'r': 1, 'z': 2, 'w1': 3, 'w2': 4}[left_color]]
+            right_mag = self.color_mag[:, {'g': 0, 'r': 1, 'z': 2, 'w1': 3, 'w2': 4}[right_color]]
+            x_data = left_mag - right_mag
+        else:
+            x_data = self.color_mag[:, {'g': 0, 'r': 1, 'z': 2, 'w1': 3, 'w2': 4}[x]]
+        
+        plt.figure(figsize=kwargs.get('figsize', (8,6)))
+        
+        plt.hist(x_data, bins=kwargs.get('bins', 30), color=kwargs.get('color', 'blue'), alpha=0.7)
+        plt.xlabel(f'{x}')
+        plt.ylabel('Count')
+        plt.title(f'Histogram of {x}')
+        if save:
+            plt.savefig(fname if fname else f'hist_{x}.png', dpi=300)
+            print(f"Saved histogram as {fname if fname else f'hist_{x}.png'}")
+        if show:
+            plt.show()
+        
+
+    def scat_colors(self, x='g-r', y='g-z', show=True, save=True, fname=None, **kwargs):
+        if '-' in x:
+            left_color, right_color = x.split('-')
+            left_mag = self.color_mag[:, {'g': 0, 'r': 1, 'z': 2, 'w1': 3, 'w2': 4}[left_color]]
+            right_mag = self.color_mag[:, {'g': 0, 'r': 1, 'z': 2, 'w1': 3, 'w2': 4}[right_color]]
+            x_data = left_mag - right_mag
+        else:
+            x_data = self.color_mag[:, {'g': 0, 'r': 1, 'z': 2, 'w1': 3, 'w2': 4}[x]]
+            
+        if '-' in y:
+            left_color, right_color = y.split('-')
+            left_mag = self.color_mag[:, {'g': 0, 'r': 1, 'z': 2, 'w1': 3, 'w2': 4}[left_color]]
+            right_mag = self.color_mag[:, {'g': 0, 'r': 1, 'z': 2, 'w1': 3, 'w2': 4}[right_color]]
+            y_data = left_mag - right_mag
+        else:
+            y_data = self.color_mag[:, {'g': 0, 'r': 1, 'z': 2, 'w1': 3, 'w2': 4}[y]]
+
+        plt.figure(figsize=kwargs.get('figsize', (8,6)))
+        plt.scatter(x_data, y_data, s=kwargs.get('s', 10), c=kwargs.get('c', 'blue'), alpha=kwargs.get('alpha', 0.7))
+        plt.xlabel(f'{x}')
+        plt.ylabel(f'{y}')
+        plt.title(f'Scatter plot of {y} vs {x}')
+        
+        if save:
+            plt.savefig(fname if fname else f'scat_{y}_vs_{x}.png', dpi=300)
+            print(f"Saved scatter plot as {fname if fname else f'scat_{y}_vs_{x}.png'}")
+        if show:
+            plt.show()
+    
+    def step_spectrum(self, i, range=None, show=True, save=True, fname=None, **kwargs):
+        lam = desi_wavelength.copy() /  (1 + self.z[i])
+        mask = self.mask[i]
+        flux = self.coadd_data[i]
+        ivar = self.ivar[i]
+        sigma = np.sqrt(1 / ivar)
+
+        
+        if range:
+            crop = (lam > range[0]) & (lam < range[1])
+            lam = lam[crop]
+            flux = flux[crop]
+            sigma = sigma[crop]
+            mask = mask[crop]
+
+        plt.figure(figsize=kwargs.get('figsize', (12,6)))
+        plt.step(lam, flux, where='mid', color=kwargs.get('color', 'black'), label='Flux')
+        plt.plot(lam, sigma, color=kwargs.get('sigma_color', 'red'), linestyle='--', label='sigma')
+        plt.plot(lam, mask*10, color=kwargs.get('mask_color', 'red'), linestyle=':', label='mask')
+        for line_name, line_wavelength in lines_vac.items():
+            for lw in line_wavelength:
+                if lw > np.max(lam) or lw < np.min(lam):
+                    continue
+                else:
+                    plt.axvline(x=lw, color=kwargs.get('line_color', 'darkgreen'), linestyle=':', alpha=0.7)
+                    plt.text(lw+3, np.max(flux)*0.95, line_name, rotation=90, color=kwargs.get('line_color', 'darkgreen'), fontsize=8)
+        
+        plt.xlabel('Rest Wavelength (Å)')
+        plt.ylabel('Flux')
+        plt.title(f'Spectrum of TargetID: {self.targetID[i]} at z={self.z[i]:.4f}')
+        plt.legend()
+        plt.xlim(kwargs.get('xlim', (np.min(lam), np.max(lam))))
+        
+        if save:
+            plt.savefig(fname if fname else f'spectrum_{self.targetID[i]}.png')
+            print(f"Saved spectrum plot as {fname if fname else f'spectrum_{self.targetID[i]}.png'}")
+        if show:
+            plt.show()
+    
+    def plot_model(self):
+        
+        return

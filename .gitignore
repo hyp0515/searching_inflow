@@ -1,3 +1,6 @@
 .DS_Store
 figures/*/*.png
 *.txt
+*.npy
+*.npz
+*.png
