@@ -9,6 +9,7 @@ import warnings
 from multiprocessing import Pool, cpu_count
 import functools
 import tqdm
+from typing import Dict, List, Tuple, Optional
 
 c = const.c.cgs.value * 1e-4  # speed of light in km/s
 desi_wavelength = np.arange(3600, 9824 + .8, .8) # DESI's observe wavelength
@@ -140,69 +141,80 @@ class Spectrum:
 
     def __init__(self, spectra_data, color_data):
         
-        
-        
-        # Match target IDs between spectra and color catalogs
-        targetID_spectra = spectra_data[1].data[:]['TARGETID'] # spectra catalog has 100638 spectra
-        targetID_color    = color_data[1].data[:]['TARGETID'] # color catalog has 100642 spectra
-        rearranged_indices = np.searchsorted(targetID_color, targetID_spectra)
-        targetID_color = targetID_color[rearranged_indices]
+        sd1 = spectra_data[1].data
+        cd1 = color_data[1].data
 
-        self.targetID       = np.array(targetID_spectra)
-        self.z_pipe         = np.array(spectra_data[1].data['Z'])
-        self.z              = self.z_pipe.copy()
-        self.RA             = spectra_data[1].data['RA']
-        self.DEC            = spectra_data[1].data['DEC']
+        targetID_spectra = sd1['TARGETID']
+        targetID_color   = cd1['TARGETID']
 
-        self.coadd_data     = np.take(spectra_data[2].data, 0, axis=1)
-        self.ivar           = np.take(spectra_data[3].data, 0, axis=1)
-        self.mask           = np.take(spectra_data[4].data, 0, axis=1)
+        # robust + fast alignment
+        order = np.argsort(targetID_color)
+        pos = np.searchsorted(targetID_color[order], targetID_spectra)
+        rearranged_indices = order[pos]
+
+        self.targetID = np.asarray(targetID_spectra)
+        self.z_pipe   = np.asarray(sd1['Z'])
+        self.z        = self.z_pipe.copy()
+        self.RA       = np.asarray(sd1['RA'])
+        self.DEC      = np.asarray(sd1['DEC'])
+
+        self.coadd_data = np.asarray(spectra_data[2].data, dtype=np.float32)[:, 0, :]
+        self.ivar       = np.asarray(spectra_data[3].data, dtype=np.float32)[:, 0, :]
+        self.mask       = np.asarray(spectra_data[4].data, dtype=np.float32)[:, 0, :]
 
         self.spectype      = color_data[1].data['SPECTYPE'][rearranged_indices]
         
-        g_flux = color_data[1].data['FLUX_G']
-        r_flux = color_data[1].data['FLUX_R']
-        z_flux = color_data[1].data['FLUX_Z']
-        w1_flux = color_data[1].data['FLUX_W1']
-        w2_flux = color_data[1].data['FLUX_W2']
-        color_flux = np.vstack([g_flux, r_flux, z_flux, w1_flux, w2_flux]).T
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", category=RuntimeWarning)
-            self.color_mag = (22.5 - 2.5 * np.log10(color_flux))[rearranged_indices, :]
+        g = cd1['FLUX_G']; r = cd1['FLUX_R']; z = cd1['FLUX_Z']
+        w1 = cd1['FLUX_W1']; w2 = cd1['FLUX_W2']
+        color_flux = np.column_stack((g, r, z, w1, w2))
+        with np.errstate(divide='ignore', invalid='ignore'):
+            color_mag_all = 22.5 - 2.5 * np.log10(color_flux)
+        self.color_mag = color_mag_all[rearranged_indices]
         
-        self.n_spectra      = len(spectra_data[1].data)
-        self.adjust_z_mode   = [[] for _ in range(self.n_spectra)]
-        self.searched_NaD    = [[] for _ in range(self.n_spectra)]
-        self.target_label    = [[] for _ in range(self.n_spectra)]
-        self.smoothed_flux = smooth_spectrum(self.coadd_data, sigma=1)
+        
+        self.n_spectra = len(self.targetID)
+        self.adjust_z_mode = None   # make these lazy if large & rarely used
+        self.searched_NaD  = None
+        self.target_label  = None
+        self._id_to_idx = {int(tid): i for i, tid in enumerate(self.targetID)}
     
-    def shrink_dataset(self, indices):
-        self.n_spectra      = len(self.targetID[::indices])
-        self.targetID       = self.targetID[::indices]
-        self.z_pipe         = self.z_pipe[::indices]
-        self.z              = self.z[::indices]
-        self.RA             = self.RA[::indices]
-        self.DEC            = self.DEC[::indices]
-        self.coadd_data     = self.coadd_data[::indices]
-        self.ivar           = self.ivar[::indices]
-        self.mask           = self.mask[::indices]
-        self.color_mag      = self.color_mag[::indices]
-        self.smoothed_flux  = self.smoothed_flux[::indices]
+    def _apply_index(self, idx):
+        # idx may be a boolean mask or integer array
+        self.targetID   = self.targetID[idx]
+        self.z_pipe     = self.z_pipe[idx]
+        self.z          = self.z[idx]
+        self.RA         = self.RA[idx]
+        self.DEC        = self.DEC[idx]
+        self.coadd_data = self.coadd_data[idx]
+        self.ivar       = self.ivar[idx]
+        self.mask       = self.mask[idx]
+        if hasattr(self, "color_mag"):      self.color_mag = self.color_mag[idx]
+        if hasattr(self, "smoothed_flux"):  self.smoothed_flux = self.smoothed_flux[idx]
+        if hasattr(self, "target_label") and self.target_label is not None:
+            if isinstance(idx, np.ndarray) and idx.dtype == bool:
+                self.target_label = [lbl for lbl, keep in zip(self.target_label, idx) if keep]
+            else:
+                self.target_label = [self.target_label[i] for i in np.atleast_1d(idx)]
+
+        self.n_spectra = len(self.targetID)
+        self._id_to_idx = {int(tid): i for i, tid in enumerate(self.targetID)}
+    
+    def shrink_dataset(self, step: int):
+        self._apply_index(slice(None, None, step))
+
+    def subset(self, criteria):
+        self._apply_index(criteria)
 
     #
     # Translate targetID to index
     #
     def id2index(self, targetID):
-        """
-        Convert targetID to index in the dataset.
-        """
-        try:
-            index = np.where(self.targetID == targetID)[0][0]
-            return index
-        except IndexError:
-            print(f"targetID {targetID} not found in the dataset.")
-            return None
-    
+        idx = self._id_to_idx.get(int(targetID))
+        if idx is None:
+            raise ValueError(f"targetID {targetID} not found in the dataset.")
+        else:
+            return idx
+
     #
     # Color criteria
     #
@@ -259,62 +271,26 @@ class Spectrum:
             label_type (str, optional): Type of label to add. Defaults to 'QSO'.
             label_at (int, optional): Index to add the label at. Defaults to None. This is only used when label_type is uncategorized.
         """
+        self.target_label = [set() for _ in range(self.n_spectra)] if self.target_label is None else self.target_label
         if i is not None:
-            self.target_label[i].append(label_type)
+            self.target_label[i].add(label_type)
         elif criteria is not None:
-            self.target_label[criteria].append(label_type)
+            self.target_label[criteria].add(label_type)
 
     def clean_label(self, label=None):
         if (label is None):
-            self.target_label = [[] for _ in range(self.n_spectra)]
+            self.target_label = [set() for _ in range(self.n_spectra)]
         elif (label is not None):
             for j in range(self.n_spectra):
                 if label in self.target_label[j]:
                     self.target_label[j].remove(label)
-
-    def label_filter(self, label=['QSO', 'NaD'], exclude=True):
-        
-        if label is None:
-            print("Please specify the label to filter.")
-            print("Available labels: ", ['QSO', 'LRG', 'ELG', 'BGS', 'MWS'] + list(lines_air.keys()))
-            print("Dataset remains unfiltered.")
-            return
-        elif any(lbl not in ['QSO', 'LRG', 'ELG', 'BGS', 'MWS'] + list(lines_air.keys()) for lbl in label):
-            print(f"Label '{label}' not recognized. Available labels: {['QSO', 'LRG', 'ELG', 'BGS', 'MWS'] + list(lines_air.keys())}")
-            print("Dataset remains unfiltered.")
-            return
-
-        is_label = []
-        for i in range(self.n_spectra):
-            is_label.append(all(lbl in self.target_label[i] for lbl in label))
-
-        is_label = np.array(is_label)
-        if exclude:
-            is_label = ~is_label
-            
-        self.n_spectra      = len(self.targetID[is_label])
-        self.targetID       = self.targetID[is_label]
-        self.z_pipe         = self.z_pipe[is_label]
-        self.z              = self.z[is_label]
-        self.RA             = self.RA[is_label]
-        self.DEC            = self.DEC[is_label]
-        self.coadd_data     = self.coadd_data[is_label][:]
-        self.ivar           = self.ivar[is_label][:]
-        self.mask           = self.mask[is_label][:]
-        self.target_label   = [lbls for j, lbls in enumerate(self.target_label) if is_label[j]]
     
-    def subset(self, criteria):
-        self.n_spectra      = len(self.targetID[criteria])
-        self.targetID       = self.targetID[criteria]
-        self.z_pipe         = self.z_pipe[criteria]
-        self.z              = self.z[criteria]
-        self.RA             = self.RA[criteria]
-        self.DEC            = self.DEC[criteria]
-        self.coadd_data     = self.coadd_data[criteria][:]
-        self.ivar           = self.ivar[criteria][:]
-        self.mask           = self.mask[criteria][:]
-        
-
+    def label_filter(self, labels, exclude=True):
+        is_label = np.array([any(lbl in set(x) for lbl in labels) for x in self.target_label])
+        if exclude: is_label = ~is_label
+        self._apply_index(is_label)
+    
+    
 class FitSpectrum:
     def __init__(self, data_class:Spectrum):
         self.n_spectra     = data_class.n_spectra
@@ -332,11 +308,24 @@ class FitSpectrum:
         self.spectype      = data_class.spectype
         self.color_mag     = data_class.color_mag
         self.id2index      = data_class.id2index
+        self.stack_data()
+
+    def stack_data(self):
+        lam = np.tile(desi_wavelength, (self.n_spectra, 1))
+        data_stack = np.column_stack((lam, self.coadd_data, self.ivar, self.mask))
+        self.data_stack = data_stack.reshape(self.n_spectra, 4, -1)
+
+    def shift_to_rest_frame(self, z=None):
+        if z is not None:
+            self.data_stack[:, 0, :] = self.data_stack[:, 0, :] / (1 + z)
+        else:
+            self.data_stack[:, 0, :] = self.data_stack[:, 0, :] / (1 + self.z[:, np.newaxis])
+
     #
     # Fit spectrum
-    #    
+    # 
     def fit_flux(self, 
-                 i=None, 
+                 id=None, 
                  fitting_model=model, 
                  lam0=None, 
                  region=None, 
@@ -345,6 +334,8 @@ class FitSpectrum:
                  e_or_a='e',):
 
         ##############################
+        i = self.id2index(id)
+        
         """
         Data to fit
         """
@@ -407,109 +398,109 @@ class FitSpectrum:
             return fitting_model(lam, gaussian_parms=gaussian_parms, conti_parms=conti_parms)
         
         
-        if i is not None:
-            flux = self.coadd_data[i]
-            ivar = self.ivar[i]
-            z = self.z[i]
-            
-            if region is None:
-                region = (np.min(lam0)*(1+z)- 50, np.max(lam0)*(1+z) + 50)
+        flux = self.coadd_data[i]
+        ivar = self.ivar[i]
+        z = self.z[i]
+        
+        if region is None:
+            region = (np.min(lam0)*(1+z)- 50, np.max(lam0)*(1+z) + 50)
 
-            crop_region = (lam >= region[0]) & (lam <= region[1])
-            lam = lam[crop_region]
-            flux = flux[crop_region]
-            ivar = ivar[crop_region]
-            mask = self.mask[i][crop_region]
-            
-            good = (mask == 0)
-            lam = lam[good]
-            flux = flux[good]
-            ivar = ivar[good]
-            sigma = np.sqrt(1 / ivar)
+        crop_region = (lam >= region[0]) & (lam <= region[1])
+        lam = lam[crop_region]
+        flux = flux[crop_region]
+        ivar = ivar[crop_region]
+        mask = self.mask[i][crop_region]
+        
+        good = (mask == 0) & (ivar != 0)
+        lam = lam[good]
+        flux = flux[good]
+        ivar = ivar[good]
+        sigma = np.sqrt(1 / ivar)
 
-            # Initial guess for parameters
+        # Initial guess for parameters
+
+        conti_a_init, conti_b_init = 0.0, 0.0
+        conti_a_lower, conti_a_upper = -np.inf, np.inf
+        conti_b_lower, conti_b_upper = 0.0, np.inf
+
+        if (fit_z is True) and (two_component is True):
+            """
+            base_2 or OII_2 model
+            len(p0) = 3 + n_fit_line * 2 + 3
+            """
+            
+            dz_init, dz_upper, dz_lower                 = 0, 0.01, -0.01
+            sigma_1_init, sigma_1_upper, sigma_1_lower  = 1, 10/(2*np.sqrt(2*np.log(2))), 2/(2*np.sqrt(2*np.log(2)))
+            sigma_2_init, sigma_2_upper, sigma_2_lower  = 1, 10/(2*np.sqrt(2*np.log(2))), 2/(2*np.sqrt(2*np.log(2)))
+            dlam_init, dlam_upper, dlam_lower           = 0, 10, -10
+            amp_init, amp_upper, amp_lower              = [1]*len(lam0), [np.inf]*len(lam0), [0]*len(lam0)
+            
+            p0 = [dz_init, sigma_1_init, sigma_2_init] + amp_init + [dlam_init, conti_a_init, conti_b_init]
+            bounds_lower = [dz_lower, sigma_1_lower, sigma_2_lower] + amp_lower + [dlam_lower, conti_a_lower, conti_b_lower]
+            bounds_upper = [dz_upper, sigma_1_upper, sigma_2_upper] + amp_upper + [dlam_upper, conti_a_upper, conti_b_upper]
+        
+        elif (fit_z is True) and (two_component is False):
+            """
+            base or OII model
+            len(p0) = 2 + n_fit_line + 2
+            """
+            dz_init, dz_upper, dz_lower                 = 0, 0.01, -0.01
+            sigma_1_init, sigma_1_upper, sigma_1_lower  = 1, 10/(2*np.sqrt(2*np.log(2))), 2/(2*np.sqrt(2*np.log(2)))
+            amp_init, amp_upper, amp_lower              = [1]*len(lam0), [np.inf]*len(lam0), [0]*len(lam0)
+            
+            p0 = [dz_init, sigma_1_init] + amp_init + [conti_a_init, conti_b_init]
+            bounds_lower = [dz_lower, sigma_1_lower] + amp_lower + [conti_a_lower, conti_b_lower]
+            bounds_upper = [dz_upper, sigma_1_upper] + amp_upper + [conti_a_upper, conti_b_upper]
+            
+        elif (fit_z is False) and (two_component is True):
+            """
+            Fit two components without redshift adjustment
+            len(p0) = 2 + n_fit_line * 2 + 3
+            """
+            sigma_1_init, sigma_1_upper, sigma_1_lower  = 1, 10/(2*np.sqrt(2*np.log(2))), 2/(2*np.sqrt(2*np.log(2)))
+            sigma_2_init, sigma_2_upper, sigma_2_lower  = 1, 10/(2*np.sqrt(2*np.log(2))), 2/(2*np.sqrt(2*np.log(2)))
+            dlam_init, dlam_upper, dlam_lower           = 0, 6, -6
+            if e_or_a == 'a':
+                amp_init, amp_upper, amp_lower          = [-1]*len(lam0), [0]*len(lam0), [-np.inf]*len(lam0)
+            else:
+                amp_init, amp_upper, amp_lower          = [1]*len(lam0), [np.inf]*len(lam0), [0]*len(lam0)
+            
+            p0 = [sigma_1_init, sigma_2_init] + amp_init + [dlam_init, conti_a_init, conti_b_init]
+            bounds_lower = [sigma_1_lower, sigma_2_lower] + amp_lower + [dlam_lower, conti_a_lower, conti_b_lower]
+            bounds_upper = [sigma_1_upper, sigma_2_upper] + amp_upper + [dlam_upper, conti_a_upper, conti_b_upper]
+        
+        elif (fit_z is False) and (two_component is False):
+            """
+            Fit one component without redshift adjustment
+            len(p0) = 1 + n_fit_line + 3
+            """
+            sigma_1_init, sigma_1_upper, sigma_1_lower  = 1, 10/(2*np.sqrt(2*np.log(2))), 2/(2*np.sqrt(2*np.log(2)))
+            offset_init, offset_upper, offset_lower     = 0, 6, -6
+            if e_or_a == 'a':
+                amp_init, amp_upper, amp_lower          = [-1]*len(lam0), [0]*len(lam0), [-np.inf]*len(lam0)
+            else:
+                amp_init, amp_upper, amp_lower          = [1]*len(lam0), [np.inf]*len(lam0), [0]*len(lam0)
+
+            p0 = [sigma_1_init] + amp_init + [offset_init, conti_a_init, conti_b_init]
+            bounds_lower = [sigma_1_lower] + amp_lower + [offset_lower, conti_a_lower, conti_b_lower]
+            bounds_upper = [sigma_1_upper] + amp_upper + [offset_upper, conti_a_upper, conti_b_upper]
+
+        try:
+            popt, pcov = curve_fit(fitting_func, lam, flux, p0=p0, sigma=sigma, bounds=(bounds_lower, bounds_upper), absolute_sigma=True)
+            if popt is None:
+                status = False
+            else:
+                status = True
+        except:
+            popt = None
+            status = False
+
+        return popt, status
+
+
+
     
-            conti_a_init, conti_b_init = 0.0, 0.0
-            conti_a_lower, conti_a_upper = -np.inf, np.inf
-            conti_b_lower, conti_b_upper = 0.0, np.inf
-
-            if (fit_z is True) and (two_component is True):
-                """
-                base_2 or OII_2 model
-                len(p0) = 3 + n_fit_line * 2 + 3
-                """
-                
-                dz_init, dz_upper, dz_lower                 = 0, 0.01, -0.01
-                sigma_1_init, sigma_1_upper, sigma_1_lower  = 1, 10/(2*np.sqrt(2*np.log(2))), 2/(2*np.sqrt(2*np.log(2)))
-                sigma_2_init, sigma_2_upper, sigma_2_lower  = 1, 10/(2*np.sqrt(2*np.log(2))), 2/(2*np.sqrt(2*np.log(2)))
-                dlam_init, dlam_upper, dlam_lower           = 0, 10, -10
-                amp_init, amp_upper, amp_lower              = [1]*len(lam0), [np.inf]*len(lam0), [0]*len(lam0)
-                
-                p0 = [dz_init, sigma_1_init, sigma_2_init] + amp_init + [dlam_init, conti_a_init, conti_b_init]
-                bounds_lower = [dz_lower, sigma_1_lower, sigma_2_lower] + amp_lower + [dlam_lower, conti_a_lower, conti_b_lower]
-                bounds_upper = [dz_upper, sigma_1_upper, sigma_2_upper] + amp_upper + [dlam_upper, conti_a_upper, conti_b_upper]
-            
-            elif (fit_z is True) and (two_component is False):
-                """
-                base or OII model
-                len(p0) = 2 + n_fit_line + 2
-                """
-                dz_init, dz_upper, dz_lower                 = 0, 0.01, -0.01
-                sigma_1_init, sigma_1_upper, sigma_1_lower  = 1, 10/(2*np.sqrt(2*np.log(2))), 2/(2*np.sqrt(2*np.log(2)))
-                amp_init, amp_upper, amp_lower              = [1]*len(lam0), [np.inf]*len(lam0), [0]*len(lam0)
-                
-                p0 = [dz_init, sigma_1_init] + amp_init + [conti_a_init, conti_b_init]
-                bounds_lower = [dz_lower, sigma_1_lower] + amp_lower + [conti_a_lower, conti_b_lower]
-                bounds_upper = [dz_upper, sigma_1_upper] + amp_upper + [conti_a_upper, conti_b_upper]
-                
-            elif (fit_z is False) and (two_component is True):
-                """
-                Fit two components without redshift adjustment
-                len(p0) = 2 + n_fit_line * 2 + 3
-                """
-                sigma_1_init, sigma_1_upper, sigma_1_lower  = 1, 10/(2*np.sqrt(2*np.log(2))), 2/(2*np.sqrt(2*np.log(2)))
-                sigma_2_init, sigma_2_upper, sigma_2_lower  = 1, 10/(2*np.sqrt(2*np.log(2))), 2/(2*np.sqrt(2*np.log(2)))
-                dlam_init, dlam_upper, dlam_lower           = 0, 6, -6
-                if e_or_a == 'a':
-                    amp_init, amp_upper, amp_lower          = [-1]*len(lam0), [0]*len(lam0), [-np.inf]*len(lam0)
-                else:
-                    amp_init, amp_upper, amp_lower          = [1]*len(lam0), [np.inf]*len(lam0), [0]*len(lam0)
-                
-                p0 = [sigma_1_init, sigma_2_init] + amp_init + [dlam_init, conti_a_init, conti_b_init]
-                bounds_lower = [sigma_1_lower, sigma_2_lower] + amp_lower + [dlam_lower, conti_a_lower, conti_b_lower]
-                bounds_upper = [sigma_1_upper, sigma_2_upper] + amp_upper + [dlam_upper, conti_a_upper, conti_b_upper]
-            
-            elif (fit_z is False) and (two_component is False):
-                """
-                Fit one component without redshift adjustment
-                len(p0) = 1 + n_fit_line + 3
-                """
-                sigma_1_init, sigma_1_upper, sigma_1_lower  = 1, 10/(2*np.sqrt(2*np.log(2))), 2/(2*np.sqrt(2*np.log(2)))
-                offset_init, offset_upper, offset_lower     = 0, 6, -6
-                if e_or_a == 'a':
-                    amp_init, amp_upper, amp_lower          = [-1]*len(lam0), [0]*len(lam0), [-np.inf]*len(lam0)
-                else:
-                    amp_init, amp_upper, amp_lower          = [1]*len(lam0), [np.inf]*len(lam0), [0]*len(lam0)
-
-                p0 = [sigma_1_init] + amp_init + [offset_init, conti_a_init, conti_b_init]
-                bounds_lower = [sigma_1_lower] + amp_lower + [offset_lower, conti_a_lower, conti_b_lower]
-                bounds_upper = [sigma_1_upper] + amp_upper + [offset_upper, conti_a_upper, conti_b_upper]
-
-            try:
-                popt, pcov = curve_fit(fitting_func, lam, flux, p0=p0, sigma=sigma, bounds=(bounds_lower, bounds_upper), absolute_sigma=True)
-            except:
-                popt = None
-
-            return popt
-            
-        elif i is None:
-            fit_params = [[] for _ in range(self.n_spectra)]
-            for k in range(self.n_spectra):
-                popt = self.fit_flux(i=k, fitting_model=fitting_model, lam0=lam0, region=region, fit_z=fit_z)
-                fit_params[k] = popt
-            return fit_params
-
-    def adjust_z(self, i, mode='base_2'):
+    def adjust_z(self, id, mode='base_2'):
         
         """
         Adjust redshift based on fitted dz with forbidden lines.
@@ -523,6 +514,11 @@ class FitSpectrum:
         - 'no'  : No adjustment
         
         """
+        
+        i = self.id2index(id)
+        
+        if hasattr(self, 'adjust_z_mode') is False or self.adjust_z_mode is None:
+            self.adjust_z_mode = ['no'] * self.n_spectra
         
         Halpha_rest = lines_vac['Halpha']
         NII_rest    = lines_vac['NII']
@@ -539,7 +535,7 @@ class FitSpectrum:
         def get_z(fit_line, two_comp):
             region = (np.min(fit_line)*(1+self.z_pipe[i])- 50, np.max(fit_line)*(1+self.z_pipe[i]) + 50)
             try:
-                popt = self.fit_flux(i=i, fitting_model=model, lam0=fit_line, region=region, fit_z=True, two_component=two_comp)
+                popt, status = self.fit_flux(id=id, fitting_model=model, lam0=fit_line, region=region, fit_z=True, two_component=two_comp)
 
             except Exception as e:
                 print(f"Error fitting flux for {self.targetID[i]}: {e}")
@@ -560,7 +556,7 @@ class FitSpectrum:
             if popt is not None:
                 if two_comp:
                     dz, sigma_1, sigma_2, dlam, conti_a, conti_b = popt[0], popt[1], popt[2], popt[-3], popt[-2], popt[-1]
-                    if (np.abs(dlam) < 0.8) and (np.abs(dz) < 1e-4):
+                    if np.abs(dlam) < 0.8:
                         return 0
                     z = self.z_pipe[i]
                     fixed_comp = []
@@ -572,8 +568,6 @@ class FitSpectrum:
                     
                 else:
                     dz, sigma_1, conti_a, conti_b = popt[0], popt[1], popt[-2], popt[-1]
-                    if (np.abs(dz) < 1e-4):
-                        return 0
                     z = self.z_pipe[i]
                     offset_comp = []
                     for k in range(len(fit_line)):
@@ -586,15 +580,13 @@ class FitSpectrum:
                     if two_comp:
                         if min(popt[(j+len(fit_line))+3], popt[j+3]) > 3*noise:
                             count += 1
-                        
                     else:
                         if popt[j+2] > 3*noise:
                             count += 1
-                            
-                    if count >= (len(fit_line)//3):
-                        return dz
-                    else:
-                        return 0
+                if count >= (len(fit_line)//3):
+                    return dz
+                else:
+                    return 0
             else:
                 return 0
 
@@ -606,23 +598,23 @@ class FitSpectrum:
                 mode = using_mode
                 if np.abs(dz) >= 1e-4:
                     break
-            if (dz is None) or (np.abs(dz) < 1e-4):
+            if (np.abs(dz) < 1e-5):
                 mode = 'no'
                 dz = 0
         elif mode == 'base_2' or mode == 'OII_2':
             fit_line, two_comp = modes[mode]
             dz = get_z(fit_line, two_comp)
-            if np.abs(dz) < 1e-4:
+            if (np.abs(dz) < 1e-4):
                 mode = mode.replace('_2', '')
                 fit_line, two_comp = modes[mode]
                 dz = get_z(fit_line, two_comp)
-                if np.abs(dz) < 1e-4:
+                if (np.abs(dz) < 1e-5):
                     mode = 'no'
                     dz = 0
         elif mode == 'base' or mode == 'OII':
             fit_line, two_comp = modes[mode]
             dz = get_z(fit_line, two_comp)
-            if np.abs(dz) < 1e-4:
+            if (np.abs(dz) < 1e-5):
                 mode = 'no'
                 dz = 0
                 
@@ -633,7 +625,14 @@ class FitSpectrum:
         self.z[i] = self.z_pipe[i] + dz
         return dz
     
-    def search_NaD(self, i, two_component=True):
+    def search_NaD(self, id, two_component=True):
+        
+        i = self.id2index(id)
+        
+        if hasattr(self, 'searched_NaD') is False or self.searched_NaD is None:
+            self.searched_NaD = np.full(self.n_spectra, 'no', dtype=object)
+        else:
+            self.searched_NaD = np.asarray(self.searched_NaD, dtype=object)
 
         NaD_rest = lines_vac['NaD']
 
@@ -654,13 +653,15 @@ class FitSpectrum:
         
         if two_component:
             try:
-                popt = self.fit_flux(i=i, fitting_model=model, lam0=[*NaD_rest], region=region, fit_z=False, two_component=True, e_or_a='a')
+                popt, status = self.fit_flux(id=id, fitting_model=model, lam0=[*NaD_rest], region=region, fit_z=False, two_component=True, e_or_a='a')
+                if status is False:
+                    return self.search_NaD(id=id, two_component=False)
                 sigma_1, sigma_2, dlam, conti_a, conti_b = popt[0], popt[1], popt[-3], popt[-2], popt[-1]
                 amp_D1, amp_D2 = popt[2], popt[3]
                 amp_D1_free, amp_D2_free = popt[4], popt[5]
                 if np.abs(dlam) < 0.8:
                     # print(f"Small dlam in two-component fit for NaD in {self.targetID[i]}, trying one-component fit.")
-                    return self.search_NaD(i=i, two_component=False)
+                    return self.search_NaD(id=id, two_component=False)
                 
                 fixed_comp = [(amp_D1, NaD_rest[0]*(1+z), sigma_1), (amp_D2, NaD_rest[1]*(1+z), sigma_1)]
                 free_comp  = [(amp_D1_free, (NaD_rest[0]+dlam)*(1+z), sigma_2), (amp_D2_free, (NaD_rest[1]+dlam)*(1+z), sigma_2)]
@@ -679,15 +680,18 @@ class FitSpectrum:
                         self.searched_NaD[i] = 'outflow_2'
                     else:
                         self.searched_NaD[i] = 'systemic_2'
-                    return popt
+                    return popt, status
                 else:
-                    return self.search_NaD(i=i, two_component=False)
+                    return self.search_NaD(id=id, two_component=False)
             except:
                 # print(f"Two-component fit failed for NaD in {self.targetID[i]}, trying one-component fit.")
-                return self.search_NaD(i=i, two_component=False)
+                return self.search_NaD(id=id, two_component=False)
         else:
             try:
-                popt = self.fit_flux(i=i, fitting_model=model, lam0=[*NaD_rest], region=region, fit_z=False, two_component=False, e_or_a='a')
+                popt, status = self.fit_flux(id=id, fitting_model=model, lam0=[*NaD_rest], region=region, fit_z=False, two_component=False, e_or_a='a')
+                if status is False:
+                    self.searched_NaD[i] = 'no_detection'
+                    return None, False
                 sigma_1, offset, conti_a, conti_b = popt[0], popt[-3], popt[-2], popt[-1]
                 amp_D1, amp_D2 = popt[1], popt[2]
                 
@@ -706,14 +710,77 @@ class FitSpectrum:
                         self.searched_NaD[i] = 'outflow'
                     else:
                         self.searched_NaD[i] = 'systemic'
-                    return popt
+                    return popt, True
                 else:
                     self.searched_NaD[i] = 'no_detection'
-                    return None
+                    return None, False
             except Exception as e:
                 print(f"Error occurred while searching NaD for {self.targetID[i]}: {e}")
                 self.searched_NaD[i] = 'no_detection'
-                return None
+                return None, False
+
+    # def read_adjust_z_results(self, fname):
+    #     if not hasattr(self, 'adjust_z_mode') or self.adjust_z_mode is None:
+    #         self.adjust_z_mode = np.full(self.n_spectra, 'no', dtype=object)
+    #     else:
+    #         self.adjust_z_mode = np.asarray(self.adjust_z_mode, dtype=object)
+    #     self.z = np.asarray(self.z)
+    #     self.z_pipe = np.asarray(self.z_pipe)
+
+    #     # Load results (obj_id is the superset)
+    #     load = np.load(fname, allow_pickle=True)
+    #     obj_id = load['obj_id']              # shape (N_all,)
+    #     fit_method_all = load['fit_method']  # shape (N_all,)
+    #     dz_all = load['delta_z']             # shape (N_all,)
+
+    #     # Make sure targetIDs is a 1-D array
+    #     target_ids = np.atleast_1d(self.targetID)
+
+    #     # Sort obj_id once, then locate each target in the sorted array
+    #     order = np.argsort(obj_id)
+    #     sorted_ids = obj_id[order]
+
+    #     # Candidate insertion positions of target_ids in sorted_ids
+    #     pos = np.searchsorted(sorted_ids, target_ids)
+
+    #     # Check exact matches (avoid accidental neighbors)
+    #     in_bounds = (pos >= 0) & (pos < sorted_ids.size)
+    #     # Use a safe index for comparison
+    #     pos_safe = np.clip(pos, 0, sorted_ids.size - 1)
+    #     is_match = in_bounds & (sorted_ids[pos_safe] == target_ids)
+
+    #     # Build index array into the original (unsorted) load arrays, aligned to target_ids order
+    #     idx_in_all = np.full(target_ids.shape, -1, dtype=int)
+    #     idx_in_all[is_match] = order[pos[is_match]]
+
+    #     # We'll only write updates for matched targets; unmatched remain untouched
+    #     tgt_rows = np.nonzero(is_match)[0]          # positions in self.* arrays
+    #     all_rows = idx_in_all[is_match]             # positions in load arrays
+
+    #     # Apply updates (preserving the order of self.targetID)
+    #     self.adjust_z_mode[tgt_rows] = fit_method_all[all_rows]
+    #     self.z[tgt_rows] = self.z_pipe[tgt_rows] + dz_all[all_rows]
+        
+    def read_adjust_z_results(self, fname):
+        # Make sure adjust_z_mode is a NumPy array so fancy indexing works
+        if not hasattr(self, 'adjust_z_mode') or self.adjust_z_mode is None:
+            self.adjust_z_mode = np.full(self.n_spectra, 'no', dtype=object)
+        else:
+            self.adjust_z_mode = np.asarray(self.adjust_z_mode, dtype=object)
+
+        load = np.load(fname, allow_pickle=True)
+        obj_id = load['obj_id']
+        fit_method = load['fit_method']
+        dz = load['delta_z']
+
+        order = np.argsort(obj_id)
+        pos = np.searchsorted(obj_id[order], self.targetID)
+        rearranged_indices = order[pos].astype(int)
+
+        # Assign using NumPy fancy indexing
+        self.adjust_z_mode[rearranged_indices] = fit_method
+        self.z[rearranged_indices] = self.z_pipe[rearranged_indices] + dz
+
 
 class PlotSpectrum:
     def __init__(self, data_class:Spectrum):
@@ -729,6 +796,7 @@ class PlotSpectrum:
         self.target_label  = data_class.target_label
         self.spectype      = data_class.spectype
         self.color_mag     = data_class.color_mag
+        self.id2index      = data_class.id2index
 
     def hist_color(self, x='g-z', show=True, save=True, fname=None, **kwargs):
         if '-' in x:
@@ -780,8 +848,10 @@ class PlotSpectrum:
             print(f"Saved scatter plot as {fname if fname else f'scat_{y}_vs_{x}.png'}")
         if show:
             plt.show()
-    
-    def step_spectrum(self, i, range=None, show=True, save=True, fname=None, **kwargs):
+
+    def step_spectrum(self, id, range=None, show=True, save=True, fname=None, **kwargs):
+        i = self.id2index(id)
+
         lam = desi_wavelength.copy() /  (1 + self.z[i])
         mask = self.mask[i]
         flux = self.coadd_data[i]
@@ -819,7 +889,3 @@ class PlotSpectrum:
             print(f"Saved spectrum plot as {fname if fname else f'spectrum_{self.targetID[i]}.png'}")
         if show:
             plt.show()
-    
-    def plot_model(self):
-        
-        return
