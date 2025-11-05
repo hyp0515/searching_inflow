@@ -4,3 +4,4 @@ figures/*/*.png
 *.npy
 *.npz
 *.png
+*.pkl

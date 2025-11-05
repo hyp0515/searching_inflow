@@ -3,6 +3,8 @@ import matplotlib.pyplot as plt
 import astropy.constants as const
 from scipy.ndimage import gaussian_filter1d
 from scipy.optimize import curve_fit
+from scipy.interpolate import interp1d
+from scipy.stats import f
 import requests
 from pathlib import Path
 import warnings
@@ -10,6 +12,7 @@ from multiprocessing import Pool, cpu_count
 import functools
 import tqdm
 from typing import Dict, List, Tuple, Optional
+
 
 c = const.c.cgs.value * 1e-4  # speed of light in km/s
 desi_wavelength = np.arange(3600, 9824 + .8, .8) # DESI's observe wavelength
@@ -308,19 +311,50 @@ class FitSpectrum:
         self.spectype      = data_class.spectype
         self.color_mag     = data_class.color_mag
         self.id2index      = data_class.id2index
+        self.shifted       = np.full(self.n_spectra, False)
         self.stack_data()
 
     def stack_data(self):
         lam = np.tile(desi_wavelength, (self.n_spectra, 1))
-        data_stack = np.column_stack((lam, self.coadd_data, self.ivar, self.mask))
-        self.data_stack = data_stack.reshape(self.n_spectra, 4, -1)
+        fitted_model = np.zeros_like(lam)
+        data_stack = np.column_stack((lam, self.coadd_data, self.ivar, self.mask, fitted_model))
+        self.data_stack = data_stack.reshape(self.n_spectra, 5, -1)
+        self.mask_bad()
 
-    def shift_to_rest_frame(self, z=None):
-        if z is not None:
-            self.data_stack[:, 0, :] = self.data_stack[:, 0, :] / (1 + z)
+    def mask_bad(self):
+        new_grid = desi_wavelength.copy()
+        for i in range(self.n_spectra):
+            mask, ivar = self.data_stack[i, 3, :], self.data_stack[i, 2, :]
+            
+            good = (mask == 0) & (ivar != 0)
+            lam = self.data_stack[i, 0, :][good]
+            flux = self.data_stack[i, 1, :][good]
+            ivar = ivar[good]
+            
+            interpolator_flux = interp1d(lam, flux, bounds_error=False, fill_value='extrapolate')
+            interpolator_ivar = interp1d(lam, ivar, bounds_error=False, fill_value='extrapolate')
+
+            self.data_stack[i, 0, :] = new_grid
+            self.data_stack[i, 1, :] = interpolator_flux(new_grid)
+            self.data_stack[i, 2, :] = interpolator_ivar(new_grid)
+            self.data_stack[i, 3, :] = np.zeros_like(new_grid)
+            
+
+    def shift_to_rest_frame(self, i=None, id=None, dz=None):
+        if (i is None) or (id is None):
+            if self.shifted.all() is True: # all lam are shifted
+                pass
+            else:
+                self.data_stack[:, 0, :] = desi_wavelength.copy() / (1 + self.z[:, np.newaxis])
+                self.shifted[:] = True
         else:
-            self.data_stack[:, 0, :] = self.data_stack[:, 0, :] / (1 + self.z[:, np.newaxis])
-
+            if id is not None:
+                i = self.id2index(id)
+            
+            if dz is None:
+                self.data_stack[i, 0, :] = desi_wavelength.copy() / (1 + self.z[i])
+            else:
+                self.data_stack[i, 0, :] = desi_wavelength.copy() / (1 + self.z[i] + dz)
     #
     # Fit spectrum
     # 
@@ -339,7 +373,7 @@ class FitSpectrum:
         """
         Data to fit
         """
-        lam = desi_wavelength.copy()
+        # lam = desi_wavelength.copy()
         
         """
         Fitting parameters
@@ -362,15 +396,15 @@ class FitSpectrum:
                 for j in range(len(lam0)):
                     if two_component:
                         amp_j, sigma_j = params[j+3], sigma_1
-                        lam0_j = lam0[j] * (1 + z + dz) # fixed components
+                        lam0_j = lam0[j] * (1 + dz) # fixed components
 
                         if j >= len(fit_line):
                             dlam = params[-3]
                             amp_j, sigma_j = params[j+3], sigma_2
-                            lam0_j = (lam0[j]+dlam) * (1 + z + dz) # free components
+                            lam0_j = (lam0[j]+dlam) * (1 + dz) # free components
                     else:
                         amp_j, sigma_j = params[j+2], sigma_1
-                        lam0_j = lam0[j] * (1 + z + dz)
+                        lam0_j = lam0[j] * (1 + dz)
                     gaussian_parms.append((amp_j, lam0_j, sigma_j))
             else:
                 sigma_1 = params[0]
@@ -379,15 +413,15 @@ class FitSpectrum:
                 for j in range(len(lam0)):
                     if two_component:
                         amp_j, sigma_j = params[j+2], sigma_1
-                        lam0_j = lam0[j] * (1 + z) # fixed components
+                        lam0_j = lam0[j] # fixed components
                         if j >= len(fit_line):
                             dlam = params[-3]
                             amp_j, sigma_j = params[j+2], sigma_2
-                            lam0_j = (lam0[j]+dlam) * (1 + z) # free components
+                            lam0_j = (lam0[j]+dlam) # free components
                     else:
                         offset = params[-3] # system offset
                         amp_j, sigma_j = params[j+1], sigma_1
-                        lam0_j = (lam0[j] + offset) * (1 + z)
+                        lam0_j = (lam0[j] + offset)
 
                     gaussian_parms.append((amp_j, lam0_j, sigma_j))
             
@@ -397,25 +431,16 @@ class FitSpectrum:
             
             return fitting_model(lam, gaussian_parms=gaussian_parms, conti_parms=conti_parms)
         
-        
-        flux = self.coadd_data[i]
-        ivar = self.ivar[i]
-        z = self.z[i]
-        
-        if region is None:
-            region = (np.min(lam0)*(1+z)- 50, np.max(lam0)*(1+z) + 50)
+        # self.shift_to_rest_frame()
+        lam, flux, ivar = self.data_stack[i, 0, :], self.data_stack[i, 1, :], self.data_stack[i, 2, :]
+
+        if region is None: region = (np.min(lam0)-50, np.max(lam0)+50)
 
         crop_region = (lam >= region[0]) & (lam <= region[1])
         lam = lam[crop_region]
         flux = flux[crop_region]
         ivar = ivar[crop_region]
-        mask = self.mask[i][crop_region]
-        
-        good = (mask == 0) & (ivar != 0)
-        lam = lam[good]
-        flux = flux[good]
-        ivar = ivar[good]
-        sigma = np.sqrt(1 / ivar)
+        sigma = np.sqrt(1/ivar)
 
         # Initial guess for parameters
 
@@ -430,8 +455,8 @@ class FitSpectrum:
             """
             
             dz_init, dz_upper, dz_lower                 = 0, 0.01, -0.01
-            sigma_1_init, sigma_1_upper, sigma_1_lower  = 1, 10/(2*np.sqrt(2*np.log(2))), 2/(2*np.sqrt(2*np.log(2)))
-            sigma_2_init, sigma_2_upper, sigma_2_lower  = 1, 10/(2*np.sqrt(2*np.log(2))), 2/(2*np.sqrt(2*np.log(2)))
+            sigma_1_init, sigma_1_upper, sigma_1_lower  = 1, 7/(2*np.sqrt(2*np.log(2))), 2/(2*np.sqrt(2*np.log(2)))
+            sigma_2_init, sigma_2_upper, sigma_2_lower  = 1, 7/(2*np.sqrt(2*np.log(2))), 2/(2*np.sqrt(2*np.log(2)))
             dlam_init, dlam_upper, dlam_lower           = 0, 10, -10
             amp_init, amp_upper, amp_lower              = [1]*len(lam0), [np.inf]*len(lam0), [0]*len(lam0)
             
@@ -445,7 +470,7 @@ class FitSpectrum:
             len(p0) = 2 + n_fit_line + 2
             """
             dz_init, dz_upper, dz_lower                 = 0, 0.01, -0.01
-            sigma_1_init, sigma_1_upper, sigma_1_lower  = 1, 10/(2*np.sqrt(2*np.log(2))), 2/(2*np.sqrt(2*np.log(2)))
+            sigma_1_init, sigma_1_upper, sigma_1_lower  = 1, 7/(2*np.sqrt(2*np.log(2))), 2/(2*np.sqrt(2*np.log(2)))
             amp_init, amp_upper, amp_lower              = [1]*len(lam0), [np.inf]*len(lam0), [0]*len(lam0)
             
             p0 = [dz_init, sigma_1_init] + amp_init + [conti_a_init, conti_b_init]
@@ -457,13 +482,13 @@ class FitSpectrum:
             Fit two components without redshift adjustment
             len(p0) = 2 + n_fit_line * 2 + 3
             """
-            sigma_1_init, sigma_1_upper, sigma_1_lower  = 1, 10/(2*np.sqrt(2*np.log(2))), 2/(2*np.sqrt(2*np.log(2)))
-            sigma_2_init, sigma_2_upper, sigma_2_lower  = 1, 10/(2*np.sqrt(2*np.log(2))), 2/(2*np.sqrt(2*np.log(2)))
+            sigma_1_init, sigma_1_upper, sigma_1_lower  = 1, 7/(2*np.sqrt(2*np.log(2))), 2/(2*np.sqrt(2*np.log(2)))
+            sigma_2_init, sigma_2_upper, sigma_2_lower  = 1, 7/(2*np.sqrt(2*np.log(2))), 2/(2*np.sqrt(2*np.log(2)))
             dlam_init, dlam_upper, dlam_lower           = 0, 6, -6
             if e_or_a == 'a':
-                amp_init, amp_upper, amp_lower          = [-1]*len(lam0), [0]*len(lam0), [-np.inf]*len(lam0)
+                amp_init, amp_upper, amp_lower          = [-1]*len(lam0), [-(1e-2)]*len(lam0), [-np.inf]*len(lam0)
             else:
-                amp_init, amp_upper, amp_lower          = [1]*len(lam0), [np.inf]*len(lam0), [0]*len(lam0)
+                amp_init, amp_upper, amp_lower          = [1]*len(lam0), [np.inf]*len(lam0), [1e-2]*len(lam0)
             
             p0 = [sigma_1_init, sigma_2_init] + amp_init + [dlam_init, conti_a_init, conti_b_init]
             bounds_lower = [sigma_1_lower, sigma_2_lower] + amp_lower + [dlam_lower, conti_a_lower, conti_b_lower]
@@ -474,12 +499,12 @@ class FitSpectrum:
             Fit one component without redshift adjustment
             len(p0) = 1 + n_fit_line + 3
             """
-            sigma_1_init, sigma_1_upper, sigma_1_lower  = 1, 10/(2*np.sqrt(2*np.log(2))), 2/(2*np.sqrt(2*np.log(2)))
-            offset_init, offset_upper, offset_lower     = 0, 6, -6
+            sigma_1_init, sigma_1_upper, sigma_1_lower  = 1, 7/(2*np.sqrt(2*np.log(2))), 2/(2*np.sqrt(2*np.log(2)))
+            offset_init, offset_upper, offset_lower     = 0, 5, -5
             if e_or_a == 'a':
-                amp_init, amp_upper, amp_lower          = [-1]*len(lam0), [0]*len(lam0), [-np.inf]*len(lam0)
+                amp_init, amp_upper, amp_lower          = [-1]*len(lam0), [-(1e-2)]*len(lam0), [-np.inf]*len(lam0)
             else:
-                amp_init, amp_upper, amp_lower          = [1]*len(lam0), [np.inf]*len(lam0), [0]*len(lam0)
+                amp_init, amp_upper, amp_lower          = [1]*len(lam0), [np.inf]*len(lam0), [1e-2]*len(lam0)
 
             p0 = [sigma_1_init] + amp_init + [offset_init, conti_a_init, conti_b_init]
             bounds_lower = [sigma_1_lower] + amp_lower + [offset_lower, conti_a_lower, conti_b_lower]
@@ -495,10 +520,117 @@ class FitSpectrum:
             popt = None
             status = False
 
-        return popt, status
+        params = {}
+        if status is True:
+            if (fit_z is True) and (two_component is True):
+                params['dz'] = popt[0]
+                params['sigma'] = (popt[1], popt[2])
+                params['dlam'] = popt[-3]
+                params['conti_params'] = (popt[-2], popt[-1])
+                
+                fixed_comps = []
+                free_comps = []
+                for k, l_0 in enumerate(lam0):
+                    if k < len(fit_line):
+                        fixed_comps.append((popt[k+3], l_0*(1+popt[0]), popt[1]))
+                    else:
+                        free_comps.append((popt[k+3], (l_0+popt[-3])*(1+popt[0]), popt[2]))
+                params['fixed_comps'] = fixed_comps
+                params['free_comps'] = free_comps
+                params['gaussian_params'] = free_comps + fixed_comps
+                
+            elif (fit_z is True) and (two_component is False):
+                params['dz'] = popt[0]
+                params['sigma'] = popt[1]
+                params['conti_params'] = (popt[-2], popt[-1])
+                free_comps = []
+                for k, l_0 in enumerate(lam0):
+                    free_comps.append((popt[k+2], l_0*(1+popt[0]), popt[1]))
+                params['free_comps'] = free_comps
+                params['fixed_comps'] = None
+                params['gaussian_params'] = free_comps
+
+            elif (fit_z is False) and (two_component is True):
+                params['sigma'] = (popt[0], popt[1])
+                params['dlam'] = popt[-3]
+                params['conti_params'] = (popt[-2], popt[-1])
+                fixed_comps = []
+                free_comps = []
+                for k, l_0 in enumerate(lam0):
+                    if k < len(fit_line):
+                        fixed_comps.append((popt[k+2], l_0, popt[0]))
+                    else:
+                        free_comps.append((popt[k+2], l_0 + popt[-3], popt[1]))
+                params['fixed_comps'] = fixed_comps
+                params['free_comps'] = free_comps
+                params['gaussian_params'] = fixed_comps + free_comps
+                
+            elif (fit_z is False) and (two_component is False):
+                params['sigma'] = popt[0]
+                params['dlam'] = popt[-3]
+                params['conti_params'] = (popt[-2], popt[-1])
+                free_comps = []
+                for k, l_0 in enumerate(lam0):
+                    free_comps.append((popt[k+1], l_0 + popt[-3], popt[0]))
+                params['free_comps'] = free_comps
+                params['fixed_comps'] = None
+                params['gaussian_params'] = free_comps
+        else:
+            params['dz'] = None
+            params['sigma'] = None
+            params['dlam'] = None
+            params['conti_params'] = None
+            params['fixed_comps'] = None
+            params['free_comps'] = None
+            params['gaussian_params'] = None
+
+        return params, status
+    
+    def calculate_chisq(self, id, params, region=None):
+        if region is None:
+            region = [lines_vac['Halpha'][0]-40, lines_vac['Halpha'][0]+40]
+        
+        i = self.id2index(id)
+        lam = self.data_stack[i, 0, :]
+        flux = self.data_stack[i, 1, :]
+        ivar = self.data_stack[i, 2, :]
+        
+        crop = (lam > region[0]) & (lam < region[1])
+        lam = lam[crop]
+        flux = flux[crop]
+        ivar = ivar[crop]
+        
+        sigma = np.sqrt(1/ivar)
+        fitted_model = model(lam, gaussian_parms=params['gaussian_params'], conti_parms=params['conti_params'])
+
+        chisq = np.sum(((flux - fitted_model) / sigma) ** 2)
+        return chisq
+
+    def calculate_f_test(self, id, params_s, params_d, region=None):
+        if region is None:
+            region = [lines_vac['Halpha'][0]-40, lines_vac['Halpha'][0]+40]
+        
+        i = self.id2index(id)
+        lam = self.data_stack[i, 0, :]
+        flux = self.data_stack[i, 1, :]
+        crop = (lam > region[0]) & (lam < region[1])
+        lam = lam[crop]
+        flux = flux[crop]
+        
+        chisq_s = self.calculate_chisq(id, params_s, region=region)
+        chisq_d = self.calculate_chisq(id, params_d, region=region)
+
+        n_params_s = 2 + len(params_s['gaussian_params']) -2 + 2  # +2 for continuum parameters
+        n_params_d = 3 + len(params_d['gaussian_params']) -4 + 2  # +2 for continuum parameters
 
 
+        dof_s = len(flux) - n_params_s  # subtract number of parameters
+        dof_d = len(flux) - n_params_d  # subtract number of parameters
 
+        F_stat = ((chisq_s - chisq_d) / (dof_s - dof_d)) / (chisq_d / dof_d)
+        p_value = 1 - f.cdf(F_stat, dof_s - dof_d, dof_d)
+
+        return F_stat, p_value
     
     def adjust_z(self, id, mode='base_2'):
         
@@ -533,55 +665,44 @@ class FitSpectrum:
         }
 
         def get_z(fit_line, two_comp):
-            region = (np.min(fit_line)*(1+self.z_pipe[i])- 50, np.max(fit_line)*(1+self.z_pipe[i]) + 50)
+            region = (np.min(fit_line)-50, np.max(fit_line)+50)
             try:
-                popt, status = self.fit_flux(id=id, fitting_model=model, lam0=fit_line, region=region, fit_z=True, two_component=two_comp)
+                params, status = self.fit_flux(id=id, fitting_model=model, lam0=fit_line, region=region, fit_z=True, two_component=two_comp)
 
             except Exception as e:
                 print(f"Error fitting flux for {self.targetID[i]}: {e}")
                 return 0
 
-            lam = desi_wavelength.copy()
-            flux = self.coadd_data[i]
-            mask = self.mask[i]
+            lam, flux, ivar, mask = self.data_stack[i, 0, :], self.data_stack[i, 1, :], self.data_stack[i, 2, :], self.data_stack[i, 3, :]
             
             crop_region = (lam >= region[0]) & (lam <= region[1])
             lam = lam[crop_region]
             flux = flux[crop_region]
-            mask = mask[crop_region]
-            good = (mask == 0)
-            lam = lam[good]
-            flux = flux[good]
+
             
-            if popt is not None:
+            
+            if status is True:
                 if two_comp:
-                    dz, sigma_1, sigma_2, dlam, conti_a, conti_b = popt[0], popt[1], popt[2], popt[-3], popt[-2], popt[-1]
+                    dz, dlam = params['dz'], params['dlam']
+                    line_free = params['free_comps']
+                    line_fixed = params['fixed_comps']
                     if np.abs(dlam) < 0.8:
                         return 0
-                    z = self.z_pipe[i]
-                    fixed_comp = []
-                    free_comp  = []
-                    for k in range(len(fit_line)):
-                        fixed_comp.append((popt[k+3], fit_line[k]*(1+z+dz), sigma_1))
-                        free_comp.append((popt[(k+len(fit_line))+3], (fit_line[k]+dlam)*(1+z+dz), sigma_2))
-                    fitted_model = model(lam, gaussian_parms=(fixed_comp+free_comp), conti_parms=(conti_a, conti_b))
-                    
+                    fitted_model = model(lam, gaussian_parms=params['gaussian_params'], conti_parms=params['conti_params'])
+
                 else:
-                    dz, sigma_1, conti_a, conti_b = popt[0], popt[1], popt[-2], popt[-1]
-                    z = self.z_pipe[i]
-                    offset_comp = []
-                    for k in range(len(fit_line)):
-                        offset_comp.append((popt[k+2], fit_line[k]*(1+z+dz), sigma_1))
-                    fitted_model = model(lam, gaussian_parms=offset_comp, conti_parms=(conti_a, conti_b))
-                    
+                    dz = params['dz']
+                    line_free = params['free_comps']
+                    fitted_model = model(lam, gaussian_parms=params['gaussian_params'], conti_parms=params['conti_params'])
+
                 noise = np.std(flux - fitted_model)
                 count = 0
                 for j in range(len(fit_line)):
                     if two_comp:
-                        if min(popt[(j+len(fit_line))+3], popt[j+3]) > 3*noise:
+                        if min(line_free[j][0], line_fixed[j][0]) > 3*noise:
                             count += 1
                     else:
-                        if popt[j+2] > 3*noise:
+                        if line_free[j][0] > 3*noise:
                             count += 1
                 if count >= (len(fit_line)//3):
                     return dz
@@ -617,7 +738,6 @@ class FitSpectrum:
             if (np.abs(dz) < 1e-5):
                 mode = 'no'
                 dz = 0
-                
         elif mode == 'no':
             dz = 0
 
@@ -636,150 +756,77 @@ class FitSpectrum:
 
         NaD_rest = lines_vac['NaD']
 
-        region = (np.min(NaD_rest)*(1+self.z_pipe[i])- 50, np.max(NaD_rest)*(1+self.z_pipe[i]) + 50)
+        region = (np.min(NaD_rest) - 50, np.max(NaD_rest) + 50)
         
-        lam = desi_wavelength.copy()
-        flux = self.coadd_data[i]
-        mask = self.mask[i]
+        
+        z = self.z[i]
+        lam, flux, ivar, mask = self.data_stack[i, 0, :], self.data_stack[i, 1, :], self.data_stack[i, 2, :], self.data_stack[i, 3, :]
         crop_region = (lam >= region[0]) & (lam <= region[1])
         lam = lam[crop_region]
         flux = flux[crop_region]
-        mask = mask[crop_region]
-        good = (mask == 0)
-        lam = lam[good]
-        flux = flux[good]
-        
-        z = self.z[i]
         
         if two_component:
             try:
-                popt, status = self.fit_flux(id=id, fitting_model=model, lam0=[*NaD_rest], region=region, fit_z=False, two_component=True, e_or_a='a')
+                params, status = self.fit_flux(id=id, fitting_model=model, lam0=[*NaD_rest], region=region, fit_z=False, two_component=True, e_or_a='a')
                 if status is False:
                     return self.search_NaD(id=id, two_component=False)
-                sigma_1, sigma_2, dlam, conti_a, conti_b = popt[0], popt[1], popt[-3], popt[-2], popt[-1]
-                amp_D1, amp_D2 = popt[2], popt[3]
-                amp_D1_free, amp_D2_free = popt[4], popt[5]
+                
+                line_D2_fixed, line_D1_fixed = params['fixed_comps']
+                line_D2_free, line_D1_free   = params['free_comps']
+                amp_D2, _, _      = line_D2_fixed
+                amp_D1, _, _      = line_D1_fixed
+                amp_D2_free, _, _ = line_D2_free
+                amp_D1_free, _, _ = line_D1_free
+                
+                dlam = params['dlam']
                 if np.abs(dlam) < 0.8:
-                    # print(f"Small dlam in two-component fit for NaD in {self.targetID[i]}, trying one-component fit.")
                     return self.search_NaD(id=id, two_component=False)
-                
-                fixed_comp = [(amp_D1, NaD_rest[0]*(1+z), sigma_1), (amp_D2, NaD_rest[1]*(1+z), sigma_1)]
-                free_comp  = [(amp_D1_free, (NaD_rest[0]+dlam)*(1+z), sigma_2), (amp_D2_free, (NaD_rest[1]+dlam)*(1+z), sigma_2)]
-                
-                fitted_model = model(lam, gaussian_parms=(fixed_comp+free_comp), conti_parms=(conti_a, conti_b))
+
+                fitted_model = model(lam, gaussian_parms=params['gaussian_params'], conti_parms=params['conti_params'])
                 noise = np.std(flux - fitted_model)
                 
-                # count = 0
-                # for j in range(len(NaD_rest)):
-                #     if min(max(popt[1], popt[3]), max(popt[2], popt[4])) > 3*noise:
-                #         count += 1
                 if min(min(np.abs(amp_D1), np.abs(amp_D1_free)), min(np.abs(amp_D2), np.abs(amp_D2_free))) > 3*noise:
                     if dlam > 0.8:
                         self.searched_NaD[i] = 'inflow_2'
                     elif dlam < -0.8:
                         self.searched_NaD[i] = 'outflow_2'
                     else:
-                        self.searched_NaD[i] = 'systemic_2'
-                    return popt, status
+                        self.searched_NaD[i] = 'systematic_2'
+                    return params, status
                 else:
                     return self.search_NaD(id=id, two_component=False)
             except:
-                # print(f"Two-component fit failed for NaD in {self.targetID[i]}, trying one-component fit.")
                 return self.search_NaD(id=id, two_component=False)
         else:
             try:
-                popt, status = self.fit_flux(id=id, fitting_model=model, lam0=[*NaD_rest], region=region, fit_z=False, two_component=False, e_or_a='a')
+                params, status = self.fit_flux(id=id, fitting_model=model, lam0=[*NaD_rest], region=region, fit_z=False, two_component=False, e_or_a='a')
                 if status is False:
                     self.searched_NaD[i] = 'no_detection'
-                    return None, False
-                sigma_1, offset, conti_a, conti_b = popt[0], popt[-3], popt[-2], popt[-1]
-                amp_D1, amp_D2 = popt[1], popt[2]
+                    return params, False
                 
-                offset_comp = [(amp_D1, (NaD_rest[0]+offset)*(1+z), sigma_1), (amp_D2, (NaD_rest[1]+offset)*(1+z), sigma_1)]
-                fitted_model = model(lam, gaussian_parms=offset_comp, conti_parms=(conti_a, conti_b))
+                line_D2, line_D1 = params['free_comps']
+                amp_D2, _, _ = line_D2
+                amp_D1, _, _ = line_D1
+                
+                offset = params['dlam']
+                fitted_model = model(lam, gaussian_parms=params['gaussian_params'], conti_parms=params['conti_params'])
                 noise = np.std(flux - fitted_model)
                 
-                # count = 0
-                # for j in range(len(NaD_rest)):
-                #     if popt[j+1] > 3*noise:
-                #         count += 1
                 if min(np.abs(amp_D1), np.abs(amp_D2)) > 3*noise:
                     if offset > 0.8:
                         self.searched_NaD[i] = 'inflow'
                     elif offset < -0.8:
                         self.searched_NaD[i] = 'outflow'
                     else:
-                        self.searched_NaD[i] = 'systemic'
-                    return popt, True
+                        self.searched_NaD[i] = 'systematic'
+                    return params, True
                 else:
                     self.searched_NaD[i] = 'no_detection'
-                    return None, False
+                    return params, False
             except Exception as e:
                 print(f"Error occurred while searching NaD for {self.targetID[i]}: {e}")
                 self.searched_NaD[i] = 'no_detection'
-                return None, False
-
-    # def read_adjust_z_results(self, fname):
-    #     if not hasattr(self, 'adjust_z_mode') or self.adjust_z_mode is None:
-    #         self.adjust_z_mode = np.full(self.n_spectra, 'no', dtype=object)
-    #     else:
-    #         self.adjust_z_mode = np.asarray(self.adjust_z_mode, dtype=object)
-    #     self.z = np.asarray(self.z)
-    #     self.z_pipe = np.asarray(self.z_pipe)
-
-    #     # Load results (obj_id is the superset)
-    #     load = np.load(fname, allow_pickle=True)
-    #     obj_id = load['obj_id']              # shape (N_all,)
-    #     fit_method_all = load['fit_method']  # shape (N_all,)
-    #     dz_all = load['delta_z']             # shape (N_all,)
-
-    #     # Make sure targetIDs is a 1-D array
-    #     target_ids = np.atleast_1d(self.targetID)
-
-    #     # Sort obj_id once, then locate each target in the sorted array
-    #     order = np.argsort(obj_id)
-    #     sorted_ids = obj_id[order]
-
-    #     # Candidate insertion positions of target_ids in sorted_ids
-    #     pos = np.searchsorted(sorted_ids, target_ids)
-
-    #     # Check exact matches (avoid accidental neighbors)
-    #     in_bounds = (pos >= 0) & (pos < sorted_ids.size)
-    #     # Use a safe index for comparison
-    #     pos_safe = np.clip(pos, 0, sorted_ids.size - 1)
-    #     is_match = in_bounds & (sorted_ids[pos_safe] == target_ids)
-
-    #     # Build index array into the original (unsorted) load arrays, aligned to target_ids order
-    #     idx_in_all = np.full(target_ids.shape, -1, dtype=int)
-    #     idx_in_all[is_match] = order[pos[is_match]]
-
-    #     # We'll only write updates for matched targets; unmatched remain untouched
-    #     tgt_rows = np.nonzero(is_match)[0]          # positions in self.* arrays
-    #     all_rows = idx_in_all[is_match]             # positions in load arrays
-
-    #     # Apply updates (preserving the order of self.targetID)
-    #     self.adjust_z_mode[tgt_rows] = fit_method_all[all_rows]
-    #     self.z[tgt_rows] = self.z_pipe[tgt_rows] + dz_all[all_rows]
-        
-    def read_adjust_z_results(self, fname):
-        # Make sure adjust_z_mode is a NumPy array so fancy indexing works
-        if not hasattr(self, 'adjust_z_mode') or self.adjust_z_mode is None:
-            self.adjust_z_mode = np.full(self.n_spectra, 'no', dtype=object)
-        else:
-            self.adjust_z_mode = np.asarray(self.adjust_z_mode, dtype=object)
-
-        load = np.load(fname, allow_pickle=True)
-        obj_id = load['obj_id']
-        fit_method = load['fit_method']
-        dz = load['delta_z']
-
-        order = np.argsort(obj_id)
-        pos = np.searchsorted(obj_id[order], self.targetID)
-        rearranged_indices = order[pos].astype(int)
-
-        # Assign using NumPy fancy indexing
-        self.adjust_z_mode[rearranged_indices] = fit_method
-        self.z[rearranged_indices] = self.z_pipe[rearranged_indices] + dz
+                return params, False
 
 
 class PlotSpectrum:
