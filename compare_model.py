@@ -16,6 +16,12 @@ targetid = np.load('./p_value.npz')['TargetId']
 p_values = np.load('./p_value.npz')['p_values']
 
 
+plt.hist(p_values, bins=30, range=(0, 1))
+plt.xlabel('p-value')
+plt.xlim(0, 1)
+plt.ylabel('Number of spectra')
+plt.savefig('./figures/Nov5/p_value_distribution.png', dpi=150, bbox_inches='tight')
+plt.close()
 
 crop_region = [lines_vac['Halpha'][0]-40, lines_vac['Halpha'][0]+40]
 new_grid = np.arange(crop_region[0], crop_region[1], 0.8)
@@ -63,5 +69,5 @@ for i in range(3):
             cbar = fig.colorbar(pcm, ax=ax)
             cbar.set_label('median p-value')
             fig.tight_layout()
-            fig.savefig(f'./figures/wpca_halpha_coeff_heatmap_{i+1}_vs_{j+1}.png', dpi=150, bbox_inches='tight')
+            fig.savefig(f'./figures/Nov5/wpca_halpha_coeff_heatmap_{i+1}_vs_{j+1}.png', dpi=150, bbox_inches='tight')
             plt.close(fig)
