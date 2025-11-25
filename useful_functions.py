@@ -50,6 +50,14 @@ def air2vac(wave):
 
 lines_vac = {key: air2vac(np.array(value)) for key, value in lines_air.items()}
 
+OII_rest    = lines_vac['OII']
+NII_rest    = lines_vac['NII']
+Hbeta_rest  = lines_vac['Hbeta']
+Halpha_rest = lines_vac['Halpha']
+SII_rest    = lines_vac['SII']
+CaII_rest   = lines_vac['CaII']
+NaD_rest    = lines_vac['NaD']
+
 def vac2air(wave):
     """
     Convert vacuum wavelengths to air wavelengths using the formula from
@@ -145,6 +153,10 @@ class Spectrum:
     def __init__(self, spectra_data, color_data):
         
         sd1 = spectra_data[1].data
+        sd2 = spectra_data[2].data
+        sd3 = spectra_data[3].data
+        sd4 = spectra_data[4].data
+        
         cd1 = color_data[1].data
 
         targetID_spectra = sd1['TARGETID']
@@ -161,9 +173,9 @@ class Spectrum:
         self.RA       = np.asarray(sd1['RA'])
         self.DEC      = np.asarray(sd1['DEC'])
 
-        self.coadd_data = np.asarray(spectra_data[2].data, dtype=np.float32)[:, 0, :]
-        self.ivar       = np.asarray(spectra_data[3].data, dtype=np.float32)[:, 0, :]
-        self.mask       = np.asarray(spectra_data[4].data, dtype=np.float32)[:, 0, :]
+        self.coadd_data = np.asarray(sd2[:, 0, :], dtype=np.float32)
+        self.ivar       = np.asarray(sd3[:, 0, :], dtype=np.float32)
+        self.mask       = np.asarray(sd4[:, 0, :], dtype=np.float32)
 
         self.spectype      = color_data[1].data['SPECTYPE'][rearranged_indices]
         
@@ -180,6 +192,13 @@ class Spectrum:
         self.searched_NaD  = None
         self.target_label  = None
         self._id_to_idx = {int(tid): i for i, tid in enumerate(self.targetID)}
+    
+    def add_attribute(self, name, value):
+        setattr(self, name, value)
+        
+    def del_attribute(self, name):
+        if hasattr(self, name):
+            delattr(self, name)
     
     def _apply_index(self, idx):
         # idx may be a boolean mask or integer array
@@ -221,28 +240,39 @@ class Spectrum:
     #
     # Color criteria
     #
-    def color_criteria(self, criterion='g-r>=0.85', exclude=True):
-        operators = {
-            '>=': lambda x, y: x >= y,
-            '<=': lambda x, y: x <= y,
-            '>': lambda x, y: x > y,
-            '<': lambda x, y: x < y,
-        }
-        if not any(op in criterion for op in operators.keys()):
-            print(f"Criterion '{criterion}' not recognized. Available criteria: {list(operators.keys())}")
-            return np.array([False] * self.n_spectra)
-        
-        
-        left_color, right_color = criterion.split('-')
-        if any(op in right_color for op in operators.keys()):
-            operator = next(op for op in operators.keys() if op in right_color)
-            right_color, val = right_color.split(operator)
+    def color_criteria(self, blue=True, criterion=None, exclude=False):
+        if blue is None:
+            operators = {
+                '>=': lambda x, y: x >= y,
+                '<=': lambda x, y: x <= y,
+                '>': lambda x, y: x > y,
+                '<': lambda x, y: x < y,
+            }
+            if not any(op in criterion for op in operators.keys()):
+                print(f"Criterion '{criterion}' not recognized. Available criteria: {list(operators.keys())}")
+                return np.array([False] * self.n_spectra)
+            
+            
+            left_color, right_color = criterion.split('-')
+            if any(op in right_color for op in operators.keys()):
+                operator = next(op for op in operators.keys() if op in right_color)
+                right_color, val = right_color.split(operator)
+            else:
+                print(f"Criterion '{criterion}' not recognized. Available criteria: {list(operators.keys())}")
+                return np.array([False] * self.n_spectra)
+            left_mag = self.color_mag[:, {'g': 0, 'r': 1, 'z': 2, 'w1': 3, 'w2': 4}[left_color]]
+            right_mag = self.color_mag[:, {'g': 0, 'r': 1, 'z': 2, 'w1': 3, 'w2': 4}[right_color]]
+            criteria = operators[operator](left_mag - right_mag, float(val))
         else:
-            print(f"Criterion '{criterion}' not recognized. Available criteria: {list(operators.keys())}")
-            return np.array([False] * self.n_spectra)
-        left_mag = self.color_mag[:, {'g': 0, 'r': 1, 'z': 2, 'w1': 3, 'w2': 4}[left_color]]
-        right_mag = self.color_mag[:, {'g': 0, 'r': 1, 'z': 2, 'w1': 3, 'w2': 4}[right_color]]
-        criteria = operators[operator](left_mag - right_mag, float(val))
+            distance = c*self.z_pipe / 70  # in Mpc
+            magnitude_distance = 5 * (np.log10(distance * 1e6) - 1)  # in pc
+            mag = self.color_mag[:, 1] - magnitude_distance
+
+            M_sun_r = 4.64  # Absolute magnitude of the Sun in r-band
+            luminosity_r = 10**(-0.4 * (mag - M_sun_r))
+            separation_values = 1.3 * np.exp((np.log10(luminosity_r) - 13) / 1.2) + 0.45
+            criteria = (self.color_mag[:, 0] - self.color_mag[:, 1]) <= separation_values
+            
         if exclude:
             criteria = ~criteria
         return criteria
@@ -255,9 +285,6 @@ class Spectrum:
         
         # simple vectorized comparison
         is_subtype = (self.spectype == subtype.upper())
-
-        # # or explicitly with numpy
-        # is_subtype = np.equal(self.spectype, subtype.upper())
 
         if exclude:
             is_subtype = ~is_subtype
@@ -293,73 +320,544 @@ class Spectrum:
         if exclude: is_label = ~is_label
         self._apply_index(is_label)
     
-    
-class FitSpectrum:
-    def __init__(self, data_class:Spectrum):
-        self.n_spectra     = data_class.n_spectra
-        self.targetID      = data_class.targetID
-        self.z_pipe        = data_class.z_pipe
-        self.z             = data_class.z
-        self.RA            = data_class.RA
-        self.DEC           = data_class.DEC
-        self.coadd_data    = data_class.coadd_data
-        self.ivar          = data_class.ivar
-        self.mask          = data_class.mask
-        self.target_label  = data_class.target_label
-        self.adjust_z_mode = data_class.adjust_z_mode
-        self.searched_NaD  = data_class.searched_NaD
-        self.spectype      = data_class.spectype
-        self.color_mag     = data_class.color_mag
-        self.id2index      = data_class.id2index
-        self.shifted       = np.full(self.n_spectra, False)
-        self.stack_data()
-
     def stack_data(self):
-        lam = np.tile(desi_wavelength, (self.n_spectra, 1))
+        n_spectra = self.n_spectra
+        coadd_data = self.coadd_data
+        ivar = self.ivar
+        mask = self.mask
+
+        lam = np.tile(desi_wavelength, (n_spectra, 1))
         fitted_model = np.zeros_like(lam)
-        data_stack = np.column_stack((lam, self.coadd_data, self.ivar, self.mask, fitted_model))
-        self.data_stack = data_stack.reshape(self.n_spectra, 5, -1)
-        self.mask_bad()
+        data_stack = np.column_stack((lam, coadd_data, ivar, mask, fitted_model))
+        data_stack = data_stack.reshape(n_spectra, 5, -1)
+        self.add_attribute('data_stack', data_stack)
 
     def mask_bad(self):
+        if not hasattr(self, 'data_stack'):
+            self.stack_data()
+
+        n_spectra = self.n_spectra
+        data_stack = self.data_stack
         new_grid = desi_wavelength.copy()
-        for i in range(self.n_spectra):
-            mask, ivar = self.data_stack[i, 3, :], self.data_stack[i, 2, :]
-            
-            good = (mask == 0) & (ivar != 0)
-            lam = self.data_stack[i, 0, :][good]
-            flux = self.data_stack[i, 1, :][good]
-            ivar = ivar[good]
-            
-            interpolator_flux = interp1d(lam, flux, bounds_error=False, fill_value='extrapolate')
-            interpolator_ivar = interp1d(lam, ivar, bounds_error=False, fill_value='extrapolate')
 
-            self.data_stack[i, 0, :] = new_grid
-            self.data_stack[i, 1, :] = interpolator_flux(new_grid)
-            self.data_stack[i, 2, :] = interpolator_ivar(new_grid)
-            self.data_stack[i, 3, :] = np.zeros_like(new_grid)
-            
+        # Vectorized approach for interpolation
+        # Create a copy of flux and ivar to modify
+        flux_interp = data_stack[:, 1, :].copy()
+        ivar_interp = data_stack[:, 2, :].copy()
 
-    def shift_to_rest_frame(self, i=None, id=None, dz=None):
+        # Create a boolean mask for bad pixels
+        bad_mask = (data_stack[:, 3, :] != 0) | (data_stack[:, 2, :] == 0)
+
+        # Set bad pixels to NaN to be ignored by np.interp
+        flux_interp[bad_mask] = np.nan
+        ivar_interp[bad_mask] = np.nan
+
+        # Get the x-coordinates (wavelengths)
+        x_coords = data_stack[:, 0, :]
+
+        # Iterate through each spectrum to perform interpolation
+        # This is necessary because np.interp doesn't handle NaNs in y-values
+        # in a way that allows for a fully vectorized solution for this problem.
+        for i in range(n_spectra):
+            y_flux = flux_interp[i]
+            y_ivar = ivar_interp[i]
+            x = x_coords[i]
+            
+            # Create a mask for the valid (non-NaN) points for this spectrum
+            valid_mask = ~np.isnan(y_flux)
+            
+            # If there are no valid points, fill with zeros. Otherwise, interpolate.
+            if np.any(valid_mask):
+                # Interpolate flux
+                data_stack[i, 1, :] = np.interp(x, x[valid_mask], y_flux[valid_mask])
+                # Interpolate ivar
+                data_stack[i, 2, :] = np.interp(x, x[valid_mask], y_ivar[valid_mask])
+            else:
+                data_stack[i, 1, :] = 0.0
+                data_stack[i, 2, :] = 0.0
+
+        # Reset the mask array to all zeros as all bad pixels have been handled
+        data_stack[:, 3, :] = 0
+        
+        # Ensure the wavelength grid is uniform
+        data_stack[:, 0, :] = new_grid[np.newaxis, :]
+        self.data_stack = data_stack
+
+class FitSpectrum:
+    def __init__(self,):
+        pass
+
+    def shift_to_rest_frame(self, data_class:Spectrum,
+                            i=None, id=None, dz=None):
+        
+        n_spectra = data_class.n_spectra
+        data_stack = data_class.data_stack
+        id2index = data_class.id2index
+        z = data_class.z
+        
+        if hasattr(self, 'shifted') is False:
+            self.shifted = np.full(n_spectra, False)
+        
         if (i is None) or (id is None):
             if self.shifted.all() is True: # all lam are shifted
                 pass
             else:
-                self.data_stack[:, 0, :] = desi_wavelength.copy() / (1 + self.z[:, np.newaxis])
+                data_stack[:, 0, :] = desi_wavelength.copy() / (1 + z[:, np.newaxis])
                 self.shifted[:] = True
         else:
             if id is not None:
-                i = self.id2index(id)
+                i = id2index(id)
             
             if dz is None:
-                self.data_stack[i, 0, :] = desi_wavelength.copy() / (1 + self.z[i])
+                data_stack[i, 0, :] = desi_wavelength.copy() / (1 + z[i])
             else:
-                self.data_stack[i, 0, :] = desi_wavelength.copy() / (1 + self.z[i] + dz)
+                data_stack[i, 0, :] = desi_wavelength.copy() / (1 + z[i] + dz)
+            self.shifted[i] = True
+        
+        data_class.data_stack = data_stack
+        return data_class
+
     #
     # Fit spectrum
-    # 
-    def fit_flux(self, 
-                 id=None, 
+    #
+    def fit_onhs_dlam(self, data_class:Spectrum, 
+                      id=None, two_component=False):
+        
+        data_stack = data_class.data_stack
+        idx = data_class.id2index(id)
+        
+        Halpha_crop_region  = [Halpha_rest[0]-30, Halpha_rest[0]+200]
+        OII_crop_region     = [   OII_rest[0]-30,    OII_rest[1]+ 30]
+
+        lam, flux, ivar = data_stack[idx, 0, :], data_stack[idx, 1, :], data_stack[idx, 2, :]
+
+        Halpha_slice    = (lam >= Halpha_crop_region[0]) & (lam <= Halpha_crop_region[1])
+        Halpha_lam      = lam[Halpha_slice]
+        Halpha_flux     = flux[Halpha_slice]
+        Halpha_ivar     = ivar[Halpha_slice]
+        Halpha_sigma    = np.sqrt(1/Halpha_ivar)
+        
+        OII_slice       = (lam >= OII_crop_region[0]) & (lam <= OII_crop_region[1])
+        OII_lam         = lam[OII_slice]
+        OII_flux        = flux[OII_slice]
+        OII_ivar        = ivar[OII_slice]
+        OII_sigma       = np.sqrt(1/OII_ivar)
+
+        combine_lam     = np.concatenate([OII_lam, Halpha_lam])
+        combine_flux    = np.concatenate([OII_flux, Halpha_flux])
+        combine_sigma   = np.concatenate([OII_sigma, Halpha_sigma])
+
+        lines_to_fit    = [*lines_vac['OII'], *lines_vac['Halpha'], *lines_vac['NII'], *lines_vac['SII']]
+
+        if two_component:
+            lam0 = lines_to_fit + lines_to_fit
+        else:
+            lam0 = lines_to_fit
+        
+        
+        def fitting_func(lam_grid, *params):
+            
+            if two_component:
+                dz, sigma_1, sigma_2, dlam1, dlam2, conti_a_1, conti_b_1, conti_a_2, conti_b_2 = params[:9]
+                amp_start_index = 9
+            else:
+                dz, sigma_1, conti_a_1, conti_b_1, conti_a_2, conti_b_2 = params[:6]
+                amp_start_index = 6
+
+            
+            conti_parms_1           = (conti_a_1, conti_b_1)
+            conti_parms_2           = (conti_a_2, conti_b_2)
+
+            gaussian_parms_1 = []
+            gaussian_parms_2 = []
+            for j in range(len(lam0)):
+                sigma_j = sigma_1
+                amp_j   = params[j+amp_start_index]
+                if two_component:
+                    lam0_j  = (lam0[j] + dlam1) * (1 + dz)
+                    if j >= len(lines_to_fit):
+                        sigma_j = sigma_2
+                        amp_j   = params[j+amp_start_index]
+                        lam0_j  = (lam0[j] + dlam2) * (1 + dz) # free components
+                else:
+                    lam0_j  = lam0[j] * (1 + dz)
+                    
+                
+                if (j != 0) and (j != 1) and (j != (0+ len(lines_to_fit))) and (j != (1 + len(lines_to_fit))):
+                    gaussian_parms_2.append((amp_j, lam0_j, sigma_j)) # nhs
+                else:
+                    gaussian_parms_1.append((amp_j, lam0_j, sigma_j)) # OII
+
+            
+            lam1 = lam_grid[:len(OII_lam)]
+            lam2 = lam_grid[len(OII_lam):]
+
+            combine_model = np.concatenate([
+                model(lam1, gaussian_parms=gaussian_parms_1, conti_parms=conti_parms_1), # OII
+                model(lam2, gaussian_parms=gaussian_parms_2, conti_parms=conti_parms_2) # nhs
+            ])
+
+            return combine_model
+
+        dz_init, dz_upper, dz_lower                     = 0, 1e-3, -1e-3
+
+        sigma_1_init, sigma_1_upper, sigma_1_lower      = 1, 7/(2*np.sqrt(2*np.log(2))), 2/(2*np.sqrt(2*np.log(2)))
+        if two_component:
+            sigma_2_init, sigma_2_upper, sigma_2_lower  = sigma_1_init, sigma_1_upper, sigma_1_lower
+
+        if two_component:
+            dlam1_init, dlam1_upper, dlam1_lower        =  3, 8,  0     # right component
+            dlam2_init, dlam2_upper, dlam2_lower        = -3, 0, -8     # left component
+
+        conti_a_1_init, conti_b_1_init, conti_a_2_init, conti_b_2_init = 0.0, 0.0, 0.0, 0.0
+        conti_a_1_lower, conti_a_1_upper , conti_a_2_lower, conti_a_2_upper = -np.inf, np.inf, -np.inf, np.inf
+        conti_b_1_lower, conti_b_1_upper, conti_b_2_lower, conti_b_2_upper = 0.0, np.inf, 0.0, np.inf
+
+        amp_init, amp_upper, amp_lower              = [1]*len(lam0), [np.inf]*len(lam0), [0]*len(lam0)
+
+        if two_component:
+            p0 = [dz_init, sigma_1_init, sigma_2_init, dlam1_init, dlam2_init, conti_a_1_init, conti_b_1_init, conti_a_2_init, conti_b_2_init] + amp_init
+            bounds_lower = [dz_lower, sigma_1_lower, sigma_2_lower, dlam1_lower, dlam2_lower, conti_a_1_lower, conti_b_1_lower, conti_a_2_lower, conti_b_2_lower] + amp_lower
+            bounds_upper = [dz_upper, sigma_1_upper, sigma_2_upper, dlam1_upper, dlam2_upper, conti_a_1_upper, conti_b_1_upper, conti_a_2_upper, conti_b_2_upper] + amp_upper
+        else:
+            p0 = [dz_init, sigma_1_init, conti_a_1_init, conti_b_1_init, conti_a_2_init, conti_b_2_init] + amp_init
+            bounds_lower = [dz_lower, sigma_1_lower, conti_a_1_lower, conti_b_1_lower, conti_a_2_lower, conti_b_2_lower] + amp_lower
+            bounds_upper = [dz_upper, sigma_1_upper, conti_a_1_upper, conti_b_1_upper, conti_a_2_upper, conti_b_2_upper] + amp_upper
+        
+        popt, pcov = curve_fit(fitting_func, combine_lam, combine_flux, p0=p0, sigma=combine_sigma, bounds=(bounds_lower, bounds_upper), absolute_sigma=True)
+        
+        params = {}
+        if two_component:
+            dz, sigma_1, sigma_2, dlam1, dlam2, conti_a_1, conti_b_1, conti_a_2, conti_b_2 = popt[:9]
+            params['dz'] = dz
+            params['sigma'] = (sigma_1, sigma_2)
+            params['dlam'] = (dlam1, dlam2)
+            params['conti_params'] = ((conti_a_1, conti_b_1), (conti_a_2, conti_b_2))
+            right_comp = []
+            left_comp = []
+            for k, l_0 in enumerate(lam0):
+                if k < len(lines_to_fit):
+                    right_comp.append((popt[k+9], (l_0+dlam1)*(1+dz), sigma_1))
+                else:
+                    left_comp.append((popt[k+9],  (l_0+dlam2)*(1+dz), sigma_2))
+            params['right_comp'] = right_comp
+            params['left_comp'] = left_comp
+            params['gaussian_params'] = right_comp+left_comp
+        else:
+            dz, sigma_1, conti_a_1, conti_b_1, conti_a_2, conti_b_2 = popt[:6]
+            params['dz'] = dz
+            params['sigma'] = sigma_1
+            params['dlam'] = None
+            params['conti_params'] = ((conti_a_1, conti_b_1), (conti_a_2, conti_b_2))
+            gaussian_params = []
+            for k, l_0 in enumerate(lam0):
+                gaussian_params.append((popt[k+6], l_0*(1+dz), sigma_1))
+            params['gaussian_params'] = gaussian_params
+        
+        return params, (combine_lam, combine_flux, combine_sigma), len(OII_lam)
+
+    
+    def fit_onhs_dz(self, data_class:Spectrum, 
+                    id=None, two_component=False, w_dz=False):
+        
+        data_stack = data_class.data_stack
+        idx = data_class.id2index(id)
+        
+        Halpha_crop_region  = [Halpha_rest[0]-30, Halpha_rest[0]+200]
+        OII_crop_region     = [   OII_rest[0]-30,    OII_rest[1]+ 30]
+
+        lam, flux, ivar = data_stack[idx, 0, :], data_stack[idx, 1, :], data_stack[idx, 2, :]
+
+        Halpha_slice    = (lam >= Halpha_crop_region[0]) & (lam <= Halpha_crop_region[1])
+        Halpha_lam      = lam[Halpha_slice]
+        Halpha_flux     = flux[Halpha_slice]
+        Halpha_ivar     = ivar[Halpha_slice]
+        Halpha_sigma    = np.sqrt(1/Halpha_ivar)
+        
+        OII_slice       = (lam >= OII_crop_region[0]) & (lam <= OII_crop_region[1])
+        OII_lam         = lam[OII_slice]
+        OII_flux        = flux[OII_slice]
+        OII_ivar        = ivar[OII_slice]
+        OII_sigma       = np.sqrt(1/OII_ivar)
+
+        combine_lam     = np.concatenate([OII_lam, Halpha_lam])
+        combine_flux    = np.concatenate([OII_flux, Halpha_flux])
+        combine_sigma   = np.concatenate([OII_sigma, Halpha_sigma])
+
+        lines_to_fit    = [*lines_vac['OII'], *lines_vac['Halpha'], *lines_vac['NII'], *lines_vac['SII']]
+
+        if two_component:
+            lam0 = lines_to_fit + lines_to_fit
+        else:
+            lam0 = lines_to_fit
+        
+        
+        def fitting_func(lam_grid, *params):
+            
+            if two_component:
+                if w_dz:
+                    dz, sigma_1, sigma_2, dz_r, dz_l, conti_a_1, conti_b_1, conti_a_2, conti_b_2 = params[:9]
+                    amp_start_index = 9
+                else:
+                    sigma_1, sigma_2, dz_r, dz_l, conti_a_1, conti_b_1, conti_a_2, conti_b_2 = params[:8]
+                    amp_start_index = 8
+            else:
+                dz, sigma_1, conti_a_1, conti_b_1, conti_a_2, conti_b_2 = params[:6]
+                amp_start_index = 6
+
+            
+            conti_parms_1           = (conti_a_1, conti_b_1)
+            conti_parms_2           = (conti_a_2, conti_b_2)
+
+            gaussian_parms_1 = []
+            gaussian_parms_2 = []
+            for j in range(len(lam0)):
+                sigma_j = sigma_1
+                amp_j   = params[j+amp_start_index]
+                if two_component:
+                    if w_dz:
+                        lam0_j  = lam0[j] * (1 + dz + dz_r)
+                    else:
+                        lam0_j  = lam0[j] * (1 + dz_r)
+                    if j >= len(lines_to_fit):
+                        sigma_j = sigma_2
+                        amp_j   = params[j+amp_start_index]
+                        if w_dz:
+                            lam0_j  = lam0[j] * (1 + dz + dz_l)
+                        else:
+                            lam0_j  = lam0[j] * (1 + dz_l)
+                else:
+                    lam0_j  = lam0[j] * (1 + dz)
+                    
+                
+                if (j != 0) and (j != 1) and (j != (0+ len(lines_to_fit))) and (j != (1 + len(lines_to_fit))):
+                    gaussian_parms_2.append((amp_j, lam0_j, sigma_j)) # nhs
+                else:
+                    gaussian_parms_1.append((amp_j, lam0_j, sigma_j)) # OII
+
+            
+            lam1 = lam_grid[:len(OII_lam)]
+            lam2 = lam_grid[len(OII_lam):]
+
+            combine_model = np.concatenate([
+                model(lam1, gaussian_parms=gaussian_parms_1, conti_parms=conti_parms_1), # OII
+                model(lam2, gaussian_parms=gaussian_parms_2, conti_parms=conti_parms_2) # nhs
+            ])
+
+            return combine_model
+
+        dz_init, dz_upper, dz_lower                     = 0, 1e-3, -1e-3
+
+        sigma_1_init, sigma_1_upper, sigma_1_lower      = 1, 7/(2*np.sqrt(2*np.log(2))), 2/(2*np.sqrt(2*np.log(2)))
+        if two_component:
+            sigma_2_init, sigma_2_upper, sigma_2_lower  = sigma_1_init, sigma_1_upper, sigma_1_lower
+
+        if two_component:
+            dz_r_init, dz_r_upper, dz_r_lower              =  1e-6, 1e-3,     0     # right component
+            dz_l_init, dz_l_upper, dz_l_lower              = -1e-6,    0, -1e-3     # left component
+
+        conti_a_1_init, conti_b_1_init, conti_a_2_init, conti_b_2_init = 0.0, 0.0, 0.0, 0.0
+        conti_a_1_lower, conti_a_1_upper , conti_a_2_lower, conti_a_2_upper = -np.inf, np.inf, -np.inf, np.inf
+        conti_b_1_lower, conti_b_1_upper, conti_b_2_lower, conti_b_2_upper = 0.0, np.inf, 0.0, np.inf
+
+        amp_init, amp_upper, amp_lower              = [1]*len(lam0), [np.inf]*len(lam0), [0]*len(lam0)
+
+        if two_component:
+            if w_dz:
+                p0 = [dz_init, sigma_1_init, sigma_2_init, dz_r_init, dz_l_init, conti_a_1_init, conti_b_1_init, conti_a_2_init, conti_b_2_init] + amp_init
+                bounds_lower = [dz_lower, sigma_1_lower, sigma_2_lower, dz_r_lower, dz_l_lower, conti_a_1_lower, conti_b_1_lower, conti_a_2_lower, conti_b_2_lower] + amp_lower
+                bounds_upper = [dz_upper, sigma_1_upper, sigma_2_upper, dz_r_upper, dz_l_upper, conti_a_1_upper, conti_b_1_upper, conti_a_2_upper, conti_b_2_upper] + amp_upper
+            else:
+                p0 = [sigma_1_init, sigma_2_init, dz_r_init, dz_l_init, conti_a_1_init, conti_b_1_init, conti_a_2_init, conti_b_2_init] + amp_init
+                bounds_lower = [sigma_1_lower, sigma_2_lower, dz_r_lower, dz_l_lower, conti_a_1_lower, conti_b_1_lower, conti_a_2_lower, conti_b_2_lower] + amp_lower
+                bounds_upper = [sigma_1_upper, sigma_2_upper, dz_r_upper, dz_l_upper, conti_a_1_upper, conti_b_1_upper, conti_a_2_upper, conti_b_2_upper] + amp_upper
+              
+        else:
+            p0 = [dz_init, sigma_1_init, conti_a_1_init, conti_b_1_init, conti_a_2_init, conti_b_2_init] + amp_init
+            bounds_lower = [dz_lower, sigma_1_lower, conti_a_1_lower, conti_b_1_lower, conti_a_2_lower, conti_b_2_lower] + amp_lower
+            bounds_upper = [dz_upper, sigma_1_upper, conti_a_1_upper, conti_b_1_upper, conti_a_2_upper, conti_b_2_upper] + amp_upper
+        
+        popt, pcov = curve_fit(fitting_func, combine_lam, combine_flux, p0=p0, sigma=combine_sigma, bounds=(bounds_lower, bounds_upper), absolute_sigma=True)
+        
+        params = {}
+        if two_component:
+            if w_dz:
+                dz, sigma_1, sigma_2, dz_r, dz_l, conti_a_1, conti_b_1, conti_a_2, conti_b_2 = popt[:9]
+                params['dz'] = dz
+            else:
+                sigma_1, sigma_2, dz_r, dz_l, conti_a_1, conti_b_1, conti_a_2, conti_b_2 = popt[:8]
+                params['dz'] = (dz_r, dz_l)
+            params['sigma'] = (sigma_1, sigma_2)
+            params['dlam'] = (dz_r, dz_l)
+            params['conti_params'] = ((conti_a_1, conti_b_1), (conti_a_2, conti_b_2))
+            right_comp = []
+            left_comp = []
+            for k, l_0 in enumerate(lam0):
+                if w_dz:
+                    if k < len(lines_to_fit):
+                        right_comp.append((popt[k+9], l_0*(1+dz+dz_r), sigma_1))
+                    else:
+                        left_comp.append((popt[k+9],  l_0*(1+dz+dz_l), sigma_2))
+                else:
+                    if k < len(lines_to_fit):
+                        right_comp.append((popt[k+8], l_0*(1+dz_r), sigma_1))
+                    else:
+                        left_comp.append((popt[k+8],  l_0*(1+dz_l), sigma_2))
+            params['right_comp'] = right_comp
+            params['left_comp'] = left_comp
+            params['gaussian_params'] = right_comp+left_comp
+        else:
+            dz, sigma_1, conti_a_1, conti_b_1, conti_a_2, conti_b_2 = popt[:6]
+            params['dz'] = dz
+            params['sigma'] = sigma_1
+            params['dlam'] = None
+            params['conti_params'] = ((conti_a_1, conti_b_1), (conti_a_2, conti_b_2))
+            gaussian_params = []
+            for k, l_0 in enumerate(lam0):
+                gaussian_params.append((popt[k+6], l_0*(1+dz), sigma_1))
+            params['gaussian_params'] = gaussian_params
+        
+        return params, (combine_lam, combine_flux, combine_sigma), len(OII_lam)
+    
+    
+    def fit_z(self, data_class:Spectrum,
+               id=None,):
+
+        try:
+            params_2comp, (combine_lam, combine_flux, combine_sigma), separation = self.fit_onhs_dlam(data_class, id=id, two_component=True)
+            dz_l = params_2comp['dz']
+            conti_1, conti_2 = params_2comp['conti_params']
+            conti           = np.concatenate([model(combine_lam[:separation], conti_parms=conti_1), 
+                                            model(combine_lam[separation:], conti_parms=conti_2)])
+            left_comp       = np.concatenate([model(combine_lam[:separation], gaussian_parms=params_2comp['left_comp'][:2]), 
+                                            model(combine_lam[separation:], gaussian_parms=params_2comp['left_comp'][2:])])
+            right_comp      = np.concatenate([model(combine_lam[:separation], gaussian_parms=params_2comp['right_comp'][:2]), 
+                                            model(combine_lam[separation:], gaussian_parms=params_2comp['right_comp'][2:])])
+            combine_2comp   = conti + left_comp + right_comp
+            chisq_2comp     = np.sum(((combine_flux - combine_2comp)/combine_sigma)**2)
+            dof_2comp       = len(combine_flux) - 19   # 9 + 7*2 - 4(conti; not relevant to F-test)
+                
+            params_1comp, (combine_lam, combine_flux, combine_sigma), separation = self.fit_onhs_dlam(data_class, id=id, two_component=False)
+            dz_r = params_1comp['dz']
+            conti_1, conti_2 = params_1comp['conti_params']
+            conti           = np.concatenate([model(combine_lam[:separation], conti_parms=conti_1), 
+                                            model(combine_lam[separation:], conti_parms=conti_2)])
+            gaussian_comp   = np.concatenate([model(combine_lam[:separation], gaussian_parms=params_1comp['gaussian_params']), 
+                                            model(combine_lam[separation:], gaussian_parms=params_1comp['gaussian_params'])])
+            combine_1comp   = conti + gaussian_comp
+            chisq_1comp     = np.sum(((combine_flux - combine_1comp)/combine_sigma)**2)
+            dof_1comp       = len(combine_flux) - 9   # 6 + 7 - 4(conti; not relevant to F-test)
+
+            F_stat = ((chisq_1comp - chisq_2comp) / (dof_1comp - dof_2comp)) / (chisq_2comp / dof_2comp)
+            p_value = 1 - f.cdf(F_stat, dof_1comp - dof_2comp, dof_2comp)
+            
+            if p_value < 0.1: # try 2 component
+                delta_lam = np.abs(params_2comp['dlam'][0] - params_2comp['dlam'][1])
+                if delta_lam >= 0.8:
+                    mode = '2_component'
+                else:
+                    mode = '1_component'
+            else:
+                mode = '1_component'
+        except:
+            try:
+                params_1comp, (combine_lam, combine_flux, combine_sigma), separation = self.fit_onhs(data_class, id=id, two_component=False)
+                dz_r = params_1comp['dz']
+                conti_1, conti_2 = params_1comp['conti_params']
+                conti           = np.concatenate([model(combine_lam[:separation], conti_parms=conti_1), 
+                                                model(combine_lam[separation:], conti_parms=conti_2)])
+                gaussian_comp   = np.concatenate([model(combine_lam[:separation], gaussian_parms=params_1comp['gaussian_params']), 
+                                                model(combine_lam[separation:], gaussian_parms=params_1comp['gaussian_params'])])
+                combine_1comp   = conti + gaussian_comp
+            except:
+                mode = 'fit_failed'
+    
+    
+    def compare_model(self, data_class:Spectrum,
+                      id=None):
+        
+        """
+        Compare dlam and dz model fitting
+        """
+
+        try:
+            
+            params_dlam_1comp, (combine_lam, combine_flux, combine_sigma), seperation = self.fit_onhs_dlam(data_class, id=id, two_component=False)
+            conti_1, conti_2 = params_dlam_1comp['conti_params']
+            conti_dlam_1comp = np.concatenate([model(combine_lam[:seperation], conti_parms=conti_1), model(combine_lam[seperation:], conti_parms=conti_2)])
+            combine_flux_dlam_1comp = combine_flux - conti_dlam_1comp
+            gaussian_comp = np.concatenate([model(combine_lam[:seperation], gaussian_parms=params_dlam_1comp['gaussian_params']), model(combine_lam[seperation:], gaussian_parms=params_dlam_1comp['gaussian_params'])])
+            combine_1comp_dlam = gaussian_comp
+            
+            chisq_dlam_1comp = np.sum(((combine_flux_dlam_1comp - combine_1comp_dlam)/combine_sigma)**2)
+            dof_1comp       = len(combine_flux) - 9   # 6 + 7 - 4(conti; not relevant to F-test)
+            
+            
+            criteria = 3 * combine_sigma
+            count = 0
+            for comp in params_dlam_1comp['gaussian_params']:
+                amp = comp[0]
+                l0 = comp[1]
+                l0_idx = np.searchsorted(combine_lam, l0)
+                if amp > criteria[l0_idx]:
+                    count += 1
+                else:
+                    continue
+            if count >= 3:
+                pass
+            else:
+                return None
+                        
+            
+            
+            params_dlam_2comp, (combine_lam, combine_flux, combine_sigma), seperation = self.fit_onhs_dlam(data_class, id=id, two_component=True)
+            if np.abs(params_dlam_2comp['dlam'][0]-params_dlam_2comp['dlam'][1]) < 0.8:
+                return None
+            
+            conti_1, conti_2 = params_dlam_2comp['conti_params']
+            conti_dlam_2comp = np.concatenate([model(combine_lam[:seperation], conti_parms=conti_1), model(combine_lam[seperation:], conti_parms=conti_2)])
+            combine_flux_dlam_2comp = combine_flux - conti_dlam_2comp
+
+            left_comp_dlam = np.concatenate([model(combine_lam[:seperation], gaussian_parms=params_dlam_2comp['left_comp'][:2]), model(combine_lam[seperation:], gaussian_parms=params_dlam_2comp['left_comp'][2:])])
+            right_comp_dlam = np.concatenate([model(combine_lam[:seperation], gaussian_parms=params_dlam_2comp['right_comp'][:2]), model(combine_lam[seperation:], gaussian_parms=params_dlam_2comp['right_comp'][2:])])
+            combine_2comp_dlam = left_comp_dlam + right_comp_dlam
+            chisq_dlam_2comp = np.sum(((combine_flux_dlam_2comp - combine_2comp_dlam)/combine_sigma)**2)
+            dof_2comp       = len(combine_flux) - 19   # 9 + 7*2 - 4(conti; not relevant to F-test)
+            
+            
+            
+            F_stat = ((chisq_dlam_1comp - chisq_dlam_2comp) / (dof_1comp - dof_2comp)) / (chisq_dlam_2comp / dof_2comp)
+            p_value = 1 - f.cdf(F_stat, dof_1comp - dof_2comp, dof_2comp)
+            
+            
+            if p_value < 0.05: # try 2 component
+                try:
+                    params_dz_fix, (combine_lam, combine_flux, combine_sigma), seperation = self.fit_onhs_dz(data_class, id=id, two_component=True, w_dz=True)
+                    if np.abs(params_dz_fix['dlam'][0]-params_dz_fix['dlam'][1]) < 5e-5:
+                        return None
+                    conti_1, conti_2 = params_dz_fix['conti_params']
+                    conti = np.concatenate([model(combine_lam[:seperation], conti_parms=conti_1), model(combine_lam[seperation:], conti_parms=conti_2)])
+                    combine_flux_dz = combine_flux - conti
+                    left_comp_dz_fixed = np.concatenate([model(combine_lam[:seperation], gaussian_parms=params_dz_fix['left_comp'][:2]), model(combine_lam[seperation:], gaussian_parms=params_dz_fix['left_comp'][2:])])
+                    right_comp_dz_fixed = np.concatenate([model(combine_lam[:seperation], gaussian_parms=params_dz_fix['right_comp'][:2]), model(combine_lam[seperation:], gaussian_parms=params_dz_fix['right_comp'][2:])])
+                    combine_2comp_dz_fixed = left_comp_dz_fixed + right_comp_dz_fixed
+                    chisq_dz_fixed = np.sum(((combine_flux_dz - combine_2comp_dz_fixed)/combine_sigma)**2)
+                    
+                    # return (chisq_dlam_2comp, chisq_dz_fixed)
+                    return (params_dlam_2comp['dz'], params_dz_fix['dz'])
+                except:
+                    return None
+            else:
+                return None
+        except:
+            return None
+        
+        
+        
+        
+        
+    def fit_flux(self,
+                 id=None,
                  fitting_model=model, 
                  lam0=None, 
                  region=None, 

@@ -7,90 +7,88 @@ from matplotlib.widgets import Slider, Button
 from matplotlib.widgets import Button
 
 
-# OII_rest    = lines_vac['OII']
-# NII_rest    = lines_vac['NII']
-# Hbeta_rest  = lines_vac['Hbeta']
-# Halpha_rest = lines_vac['Halpha']
-# SII_rest    = lines_vac['SII']
-# CaII_rest   = lines_vac['CaII']
-# NaD_rest    = lines_vac['NaD']
+OII_rest    = lines_vac['OII']
+NII_rest    = lines_vac['NII']
+Hbeta_rest  = lines_vac['Hbeta']
+Halpha_rest = lines_vac['Halpha']
+SII_rest    = lines_vac['SII']
+CaII_rest   = lines_vac['CaII']
+NaD_rest    = lines_vac['NaD']
 
-# spectra_data = fits.open('/Users/hyp0515/data/0715_Spring_BGS_ALL_trimmed.fits')
-# color_data = fits.open('/Users/hyp0515/data/0715_Spring_half_BGS_BRIGHT_catalog_with_Flux.fits')
-# spectra = Spectrum(spectra_data, color_data)
+spectra_data = fits.open('/Users/hyp0515/data/0715_Spring_BGS_ALL_trimmed.fits')
+color_data = fits.open('/Users/hyp0515/data/0715_Spring_half_BGS_BRIGHT_catalog_with_Flux.fits')
+spectra = Spectrum(spectra_data, color_data)
 
-# blue_crit = (spectra.color_criteria(criterion='g-z<1.25', exclude=False)) & (spectra.color_criteria(criterion='g-r<0.75', exclude=False))
-# # blue_crit = (spectra.color_criteria(criterion='g-r<0.75', exclude=False))
-# qso_crit = spectra.subtype_criteria(subtype='QSO', exclude=True)
+blue_crit = spectra.color_criteria(blue=True, exclude=True)
+qso_crit = spectra.subtype_criteria(subtype='QSO', exclude=True)
 
-# spectra.subset(criteria=blue_crit & qso_crit)
-# # spectra.subset(criteria=qso_crit)
-# # spectra.shrink_dataset(5)
-
-
-# print(f"Number of spectra after criteria: {spectra.n_spectra}")
-
-# Fit = FitSpectrum(spectra)
-
-# crop_region = [lines_vac['Halpha'][0]-40, lines_vac['Halpha'][0]+40]
-# new_grid = np.arange(crop_region[0], crop_region[1], 0.8)
-
-# doable_samples = []
-# cropped_spectra = []
-# cropped_ivar = []
+spectra.subset(criteria=blue_crit & qso_crit)
+# spectra.subset(criteria=qso_crit)
+# spectra.shrink_dataset(5)
 
 
-# for i in tqdm.tqdm(range(spectra.n_spectra)):
-#     try:
-#         lam = desi_wavelength.copy() /  (1 + spectra.z[i])
-#         mask = spectra.mask[i]
-#         flux = spectra.coadd_data[i]
-#         ivar = spectra.ivar[i]
+print(f"Number of spectra after criteria: {spectra.n_spectra}")
 
-#         crop = (lam > crop_region[0]) & (lam < crop_region[1])
-#         lam = lam[crop]
-#         flux = flux[crop]
-#         ivar = ivar[crop]
-#         mask = mask[crop]
+
+crop_region = [lines_vac['Halpha'][0]-40, lines_vac['Halpha'][0]+40]
+new_grid = np.arange(crop_region[0], crop_region[1], 0.8)
+
+doable_samples = []
+cropped_spectra = []
+cropped_ivar = []
+
+
+for i in tqdm.tqdm(range(spectra.n_spectra)):
+    try:
+        lam = desi_wavelength.copy() /  (1 + spectra.z[i])
+        mask = spectra.mask[i]
+        flux = spectra.coadd_data[i]
+        ivar = spectra.ivar[i]
+
+        crop = (lam > crop_region[0]) & (lam < crop_region[1])
+        lam = lam[crop]
+        flux = flux[crop]
+        ivar = ivar[crop]
+        mask = mask[crop]
         
-#         good = (mask == 0) & (ivar != 0)
-#         lam = lam[good]
-#         flux = flux[good]
-#         ivar = ivar[good]
-#         sigma = 1 / np.sqrt(ivar)
+        good = (mask == 0) & (ivar != 0)
+        lam = lam[good]
+        flux = flux[good]
+        ivar = ivar[good]
+        sigma = 1 / np.sqrt(ivar)
         
-#         line_mask = (
-#             ((lam > (lines_vac['Halpha'][0] - 3)) & (lam < (lines_vac['Halpha'][0] + 3))) |
-#             ((lam > (lines_vac['NII'][0]    - 3)) & (lam < (lines_vac['NII'][0]    + 3))) |
-#             ((lam > (lines_vac['NII'][1]    - 3)) & (lam < (lines_vac['NII'][1]    + 3)))
-#         )
+        line_mask = (
+            ((lam > (lines_vac['Halpha'][0] - 3)) & (lam < (lines_vac['Halpha'][0] + 3))) |
+            ((lam > (lines_vac['NII'][0]    - 3)) & (lam < (lines_vac['NII'][0]    + 3))) |
+            ((lam > (lines_vac['NII'][1]    - 3)) & (lam < (lines_vac['NII'][1]    + 3)))
+        )
         
-#         conti_mask = ~line_mask
+        conti_mask = ~line_mask
 
-#         spectrum = flux
+        spectrum = flux
 
-#         conti = np.median(spectrum[conti_mask])
-#         noise = np.std(spectrum[conti_mask])
+        conti = np.median(spectrum[conti_mask])
+        noise = np.std(spectrum[conti_mask])
         
-#         if np.max(spectrum) - conti < 3 * noise or spectrum.size == 0 or ivar.size == 0:
-#             doable_samples.append(False)
-#             continue
-#         else:
-#             doable_samples.append(True)
-#             normalized_spectrum = (spectrum - conti) / (np.max(spectrum) - conti)
-#             interpolator = interp1d(lam, normalized_spectrum, bounds_error=False, fill_value='extrapolate')
-#             interpolator_ivar = interp1d(lam, ivar, bounds_error=False, fill_value='extrapolate')
-#             cropped_spectra.append(interpolator(new_grid))
-#             cropped_ivar.append(interpolator_ivar(new_grid))
-#     except:
-#         doable_samples.append(False)
-#         continue
-# spectra.subset(np.array(doable_samples))
-# print(f"Number of spectra after criteria: {spectra.n_spectra}")
+        if np.max(spectrum) - conti < 3 * noise or spectrum.size == 0 or ivar.size == 0:
+            doable_samples.append(False)
+            continue
+        else:
+            doable_samples.append(True)
+            normalized_spectrum = (spectrum - conti) / (np.max(spectrum) - conti)
+            interpolator = interp1d(lam, normalized_spectrum, bounds_error=False, fill_value='extrapolate')
+            interpolator_ivar = interp1d(lam, ivar, bounds_error=False, fill_value='extrapolate')
+            cropped_spectra.append(interpolator(new_grid))
+            cropped_ivar.append(interpolator_ivar(new_grid))
+    except:
+        doable_samples.append(False)
+        continue
+spectra.subset(np.array(doable_samples))
+print(f"Number of spectra after criteria: {spectra.n_spectra}")
 
-# np.save('./cropped_targetID_halpha.npy', spectra.targetID)
-# np.save('./cropped_spectra_halpha.npy', cropped_spectra)
-# np.save('./cropped_ivar_halpha.npy', cropped_ivar)
+np.save('./cropped_targetID_halpha.npy', spectra.targetID)
+np.save('./cropped_spectra_halpha.npy', cropped_spectra)
+np.save('./cropped_ivar_halpha.npy', cropped_ivar)
 
 crop_region = [lines_vac['Halpha'][0]-40, lines_vac['Halpha'][0]+40]
 new_grid = np.arange(crop_region[0], crop_region[1], 0.8)
@@ -105,33 +103,33 @@ weights = cropped_ivar
 pca = WPCA(n_components=10).fit(cropped_spectra, weights=weights)
 n_comp = 10
 
-# fig, ax = plt.subplots(n_comp+1, 1, figsize=(5, 3*n_comp), sharex=True)
-# plt.subplots_adjust(hspace=-0.5)
+fig, ax = plt.subplots(n_comp+1, 1, figsize=(5, 3*n_comp), sharex=True)
+plt.subplots_adjust(hspace=-0.5)
 
-# ax[0].plot(new_grid, pca.mean_, c='black')
-# ax[0].axvline(lines_vac['Halpha'][0], color='gray', linestyle='--')
-# ax[0].axvline(lines_vac['NII'][0], color='gray', linestyle='--')
-# ax[0].axvline(lines_vac['NII'][1], color='gray', linestyle='--')
-# ax[0].text(0.05, 0.85, 'Mean Spectrum', transform=ax[0].transAxes, fontsize=16)
-# ax[0].set_xticklabels([])
+ax[0].plot(new_grid, pca.mean_, c='black')
+ax[0].axvline(lines_vac['Halpha'][0], color='gray', linestyle='--')
+ax[0].axvline(lines_vac['NII'][0], color='gray', linestyle='--')
+ax[0].axvline(lines_vac['NII'][1], color='gray', linestyle='--')
+ax[0].text(0.05, 0.85, 'Mean Spectrum', transform=ax[0].transAxes, fontsize=16)
+ax[0].set_xticklabels([])
 
-# for i in range(n_comp):
-#     ax[i+1].plot(new_grid, pca.components_[i], c='black')
-#     ax[i+1].axvline(lines_vac['Halpha'][0], color='gray', linestyle='--')
-#     ax[i+1].axvline(lines_vac['NII'][0], color='gray', linestyle='--')
-#     ax[i+1].axvline(lines_vac['NII'][1], color='gray', linestyle='--')
-#     ax[i+1].axhline(0, color='gray', linestyle='--', linewidth=0.8)
-#     ax[i+1].text(0.05, 0.75, f'{100*pca.explained_variance_ratio_[i]:.2f}%', transform=ax[i+1].transAxes, fontsize=16)
-#     ax[i+1].text(0.05, 0.85, f'eigen-vector {i+1}', transform=ax[i+1].transAxes, fontsize=16)
-#     if i != n_comp - 1:
-#         ax[i+1].set_xticklabels([])
-#     # ax[i+1].set_xlabel('Wavelength Index')
-#     # ax[i+1].set_ylabel('Component Value')
-# # fig.suptitle(f'First {n_comp} Principal Vectors from WPCA', fontsize=16)
-# # ax[-1].set_xticklabels(new_grid)
-# plt.tight_layout()
-# plt.savefig('./figures/wpca_halpha_principal_vectors.png')
-# plt.close('all')
+for i in range(n_comp):
+    ax[i+1].plot(new_grid, pca.components_[i], c='black')
+    ax[i+1].axvline(lines_vac['Halpha'][0], color='gray', linestyle='--')
+    ax[i+1].axvline(lines_vac['NII'][0], color='gray', linestyle='--')
+    ax[i+1].axvline(lines_vac['NII'][1], color='gray', linestyle='--')
+    ax[i+1].axhline(0, color='gray', linestyle='--', linewidth=0.8)
+    ax[i+1].text(0.05, 0.75, f'{100*pca.explained_variance_ratio_[i]:.2f}%', transform=ax[i+1].transAxes, fontsize=16)
+    ax[i+1].text(0.05, 0.85, f'eigen-vector {i+1}', transform=ax[i+1].transAxes, fontsize=16)
+    if i != n_comp - 1:
+        ax[i+1].set_xticklabels([])
+    # ax[i+1].set_xlabel('Wavelength Index')
+    # ax[i+1].set_ylabel('Component Value')
+# fig.suptitle(f'First {n_comp} Principal Vectors from WPCA', fontsize=16)
+# ax[-1].set_xticklabels(new_grid)
+plt.tight_layout()
+plt.savefig('./figures/wpca_halpha_principal_vectors.png')
+plt.close('all')
 
 
 # plt.plot(np.arange(1, 11), pca.explained_variance_ratio_[:10], marker='o')
@@ -143,8 +141,8 @@ n_comp = 10
 # plt.savefig('./figures/wpca_halpha_variance_ratio.png')
 # plt.close('all')
 
-reconstructed_ncomp = 10
-coeff = pca.fit_transform(cropped_spectra, weights=weights)[:, :reconstructed_ncomp]
+# reconstructed_ncomp = 10
+# coeff = pca.fit_transform(cropped_spectra, weights=weights)[:, :reconstructed_ncomp]
 
 
 

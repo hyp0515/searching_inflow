@@ -26,7 +26,7 @@ spectra_data = fits.open('/Users/hyp0515/data/0715_Spring_BGS_ALL_trimmed.fits')
 color_data = fits.open('/Users/hyp0515/data/0715_Spring_half_BGS_BRIGHT_catalog_with_Flux.fits')
 spectra = Spectrum(spectra_data, color_data)
 
-blue_crit = (spectra.color_criteria(criterion='g-z<1.25', exclude=False)) | (spectra.color_criteria(criterion='g-r<0.75', exclude=False))
+blue_crit = (spectra.color_criteria(criterion='g-z<1.25', exclude=False)) & (spectra.color_criteria(criterion='g-r<0.75', exclude=False))
 qso_crit = spectra.subtype_criteria(subtype='QSO', exclude=True)
 spectra.subset(criteria=blue_crit & qso_crit)
 # spectra.shrink_dataset(20)
