@@ -17,12 +17,14 @@ NaD_rest    = lines_vac['NaD']
 
 spectra_data = fits.open('/Users/hyp0515/data/0715_Spring_BGS_ALL_trimmed.fits')
 color_data = fits.open('/Users/hyp0515/data/0715_Spring_half_BGS_BRIGHT_catalog_with_Flux.fits')
-spectra = Spectrum(spectra_data, color_data)
+cigale_data     = fits.open('/Users/hyp0515/data/IronPhysProp_v1.2.fits')
 
-blue_crit = spectra.color_criteria(blue=True, exclude=True)
+
+spectra = Spectrum(spectra_data, color_data, cigale_data)
+sfg_crit = spectra.SFG_criteria(exclude=False)
 qso_crit = spectra.subtype_criteria(subtype='QSO', exclude=True)
 
-spectra.subset(criteria=blue_crit & qso_crit)
+spectra.subset(criteria=sfg_crit & qso_crit)
 # spectra.subset(criteria=qso_crit)
 # spectra.shrink_dataset(5)
 
@@ -141,23 +143,23 @@ plt.close('all')
 # plt.savefig('./figures/wpca_halpha_variance_ratio.png')
 # plt.close('all')
 
-# reconstructed_ncomp = 10
-# coeff = pca.fit_transform(cropped_spectra, weights=weights)[:, :reconstructed_ncomp]
+reconstructed_ncomp = 10
+coeff = pca.fit_transform(cropped_spectra, weights=weights)[:, :reconstructed_ncomp]
 
 
 
-# for i in range(6):
-#     for j in range(6):
-#         if (i != j) and (i < j):
-#             plt.figure(figsize=(6, 6))
-#             plt.scatter(coeff[:, i], coeff[:, j], s=1, alpha=0.5)
-#             plt.xlabel(f'Coefficient {i+1}')
-#             plt.ylabel(f'Coefficient {j+1}')
-#             plt.title('WPCA Coefficient Scatter Plot')
-#             plt.grid(True)
-#             plt.axis('equal')
-#             plt.savefig(f'./figures/wpca_halpha_coeff_scatter_{i+1}_vs_{j+1}.png')
-#             plt.close('all')
+for i in range(6):
+    for j in range(6):
+        if (i != j) and (i < j):
+            plt.figure(figsize=(6, 6))
+            plt.scatter(coeff[:, i], coeff[:, j], s=1, alpha=0.5)
+            plt.xlabel(f'Coefficient {i+1}')
+            plt.ylabel(f'Coefficient {j+1}')
+            plt.title('WPCA Coefficient Scatter Plot')
+            plt.grid(True)
+            plt.axis('equal')
+            plt.savefig(f'./figures/wpca_halpha_coeff_scatter_{i+1}_vs_{j+1}.png')
+            plt.close('all')
 
 # plt.figure(figsize=(6, 6))
 # plt.scatter(coeff[:, 0], coeff[:, 2], s=1, alpha=0.5)
