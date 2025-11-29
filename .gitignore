@@ -3,6 +3,7 @@ figures/*/*.png
 figures/*/*.jpg
 figures/*.jpg
 figures/*.png
+images/*.jpg
 *.txt
 *.npy
 *.npz
