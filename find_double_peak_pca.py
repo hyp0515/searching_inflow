@@ -7,29 +7,26 @@ from matplotlib.widgets import Slider, Button
 from matplotlib.widgets import Button
 
 
-OII_rest    = lines_vac['OII']
-NII_rest    = lines_vac['NII']
-Hbeta_rest  = lines_vac['Hbeta']
-Halpha_rest = lines_vac['Halpha']
-SII_rest    = lines_vac['SII']
-CaII_rest   = lines_vac['CaII']
-NaD_rest    = lines_vac['NaD']
-
-spectra_data = fits.open('/Users/hyp0515/data/0715_Spring_BGS_ALL_trimmed.fits')
-color_data = fits.open('/Users/hyp0515/data/0715_Spring_half_BGS_BRIGHT_catalog_with_Flux.fits')
+spectra_data    = fits.open('/Users/hyp0515/data/0715_Spring_BGS_ALL_trimmed.fits')
+color_data      = fits.open('/Users/hyp0515/data/0715_Spring_half_BGS_BRIGHT_catalog_with_Flux.fits')
 cigale_data     = fits.open('/Users/hyp0515/data/IronPhysProp_v1.2.fits')
+fastspecfit     = fits.open('/Users/hyp0515/data/0715_Spring_half_BGS_BRIGHT_catalog_fastspecfit.fits')
+SPECTRA = Spectrum(spectra_data, color_data, cigale_data, fastspecfit)
+
+SPECTRA = SPECTRA.SFG_filter(exclude=False)
+SPECTRA = SPECTRA.subtype_filter(subtype='QSO', exclude=True)
+
+# SPECTRA.subset(criteria=sfg_crit & qso_crit)
+# SPECTRA.shrink_dataset(20)
+SPECTRA.stack_data()
+SPECTRA.mask_bad()
 
 
-spectra = Spectrum(spectra_data, color_data, cigale_data)
-sfg_crit = spectra.SFG_criteria(exclude=False)
-qso_crit = spectra.subtype_criteria(subtype='QSO', exclude=True)
+FIT     = FitSpectrum()
+SPECTRA = FIT.shift_to_rest_frame(SPECTRA)
+SPECTRA = FIT.significant_emission_filter(SPECTRA)
 
-spectra.subset(criteria=sfg_crit & qso_crit)
-# spectra.subset(criteria=qso_crit)
-# spectra.shrink_dataset(5)
-
-
-print(f"Number of spectra after criteria: {spectra.n_spectra}")
+print(f"Number of spectra after criteria: {SPECTRA.n_spectra}")
 
 
 crop_region = [lines_vac['Halpha'][0]-40, lines_vac['Halpha'][0]+40]
@@ -40,55 +37,30 @@ cropped_spectra = []
 cropped_ivar = []
 
 
-for i in tqdm.tqdm(range(spectra.n_spectra)):
+for i in tqdm.tqdm(range(SPECTRA.n_spectra)):
     try:
-        lam = desi_wavelength.copy() /  (1 + spectra.z[i])
-        mask = spectra.mask[i]
-        flux = spectra.coadd_data[i]
-        ivar = spectra.ivar[i]
+        lam     = SPECTRA.data_stack[i, 0, :]
+        flux    = SPECTRA.data_stack[i, 1, :]
+        ivar    = SPECTRA.data_stack[i, 2, :]
+        mask    = SPECTRA.data_stack[i, 3, :]
 
         crop = (lam > crop_region[0]) & (lam < crop_region[1])
-        lam = lam[crop]
-        flux = flux[crop]
-        ivar = ivar[crop]
-        mask = mask[crop]
-        
-        good = (mask == 0) & (ivar != 0)
-        lam = lam[good]
-        flux = flux[good]
-        ivar = ivar[good]
         sigma = 1 / np.sqrt(ivar)
         
-        line_mask = (
-            ((lam > (lines_vac['Halpha'][0] - 3)) & (lam < (lines_vac['Halpha'][0] + 3))) |
-            ((lam > (lines_vac['NII'][0]    - 3)) & (lam < (lines_vac['NII'][0]    + 3))) |
-            ((lam > (lines_vac['NII'][1]    - 3)) & (lam < (lines_vac['NII'][1]    + 3)))
-        )
-        
-        conti_mask = ~line_mask
 
-        spectrum = flux
-
-        conti = np.median(spectrum[conti_mask])
-        noise = np.std(spectrum[conti_mask])
-        
-        if np.max(spectrum) - conti < 3 * noise or spectrum.size == 0 or ivar.size == 0:
-            doable_samples.append(False)
-            continue
-        else:
-            doable_samples.append(True)
-            normalized_spectrum = (spectrum - conti) / (np.max(spectrum) - conti)
-            interpolator = interp1d(lam, normalized_spectrum, bounds_error=False, fill_value='extrapolate')
-            interpolator_ivar = interp1d(lam, ivar, bounds_error=False, fill_value='extrapolate')
-            cropped_spectra.append(interpolator(new_grid))
-            cropped_ivar.append(interpolator_ivar(new_grid))
+        doable_samples.append(True)
+        normalized_spectrum = flux / np.max(flux)
+        interpolator = interp1d(lam, normalized_spectrum, bounds_error=False, fill_value='extrapolate')
+        interpolator_ivar = interp1d(lam, ivar, bounds_error=False, fill_value='extrapolate')
+        cropped_spectra.append(interpolator(new_grid))
+        cropped_ivar.append(interpolator_ivar(new_grid))
     except:
         doable_samples.append(False)
         continue
-spectra.subset(np.array(doable_samples))
-print(f"Number of spectra after criteria: {spectra.n_spectra}")
+SPECTRA.subset(np.array(doable_samples))
+print(f"Number of spectra after criteria: {SPECTRA.n_spectra}")
 
-np.save('./cropped_targetID_halpha.npy', spectra.targetID)
+np.save('./cropped_targetID_halpha.npy', SPECTRA.targetID)
 np.save('./cropped_spectra_halpha.npy', cropped_spectra)
 np.save('./cropped_ivar_halpha.npy', cropped_ivar)
 

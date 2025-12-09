@@ -1,3 +1,4 @@
+from matplotlib.table import Table
 import numpy as np
 import matplotlib.pyplot as plt
 import astropy.constants as const
@@ -11,8 +12,9 @@ import warnings
 from multiprocessing import Pool, cpu_count
 import functools
 import tqdm
-from typing import Dict, List, Tuple, Optional
-
+import pandas as pd
+from astropy.table import Table
+from astropy.io import fits
 
 c = const.c.cgs.value * 1e-4  # speed of light in km/s
 desi_wavelength = np.arange(3600, 9824 + .8, .8) # DESI's observe wavelength
@@ -154,72 +156,129 @@ def spectrum_link(targetID):
     return f'https://www.legacysurvey.org/viewer/desi-spectrum/dr1/targetid{targetID}'
 
 
+def new_fits(fits_data, targetIDs, fname=None):
+    """
+    Create a new FITS file containing only the entries for the specified target IDs.
+
+    Parameters:
+    fits_data : astropy.io.fits.HDUList
+        The original FITS data.
+    targetIDs : list or array-like
+        List of target IDs to include in the new FITS file.
+
+    Returns:
+    astropy.io.fits.HDUList
+        A new FITS HDUList containing only the specified target IDs.
+    """
+
+    # Create a mask for the rows to keep
+    original_targetIDs = fits_data[1].data['TARGETID']
+    mask = np.isin(original_targetIDs, targetIDs)
+
+    # Create a new HDUList
+    new_hdul = fits.HDUList()
+    
+    # Copy the primary HDU
+    new_hdul.append(fits.PrimaryHDU(header=fits_data[0].header))
+    
+    # Copy and filter each extension
+    for i in range(1, len(fits_data)):
+        hdu = fits_data[i]
+        header = hdu.header
+        if isinstance(hdu, fits.BinTableHDU):
+            # This is a table, filter rows based on TARGETID
+            # This assumes the table has the same number of rows as the one used to create the mask
+            if hdu.data is not None and len(hdu.data) == len(mask):
+                data = hdu.data[mask]
+                new_hdul.append(fits.BinTableHDU(data=data, header=header, name=hdu.name))
+            else:
+                # If row count doesn't match, copy as is with a warning or handle as needed
+                new_hdul.append(hdu)
+        else:
+            # For other HDU types, just copy them
+            new_hdul.append(hdu)
+    
+    if fname is not None:
+        new_hdul.writeto(fname, overwrite=True)
+        print(f"New FITS file saved as {fname}")
+    
+    return new_hdul
+    
+
 ################################################################################################################
 class Spectrum:
 
-    def __init__(self, spectra_data, color_data, cigale_data, fastspecfit_data):
+    def __init__(self, spectra_data, color_data, cigale_data, fastspecfit_data, load_targetID=None):
 
-        # Extract data tables
-        sd1_all         = spectra_data[1].data
-        cd1_all         = color_data[1].data
-        cigale_all      = cigale_data[1].data
-        fastspecfit_all = fastspecfit_data[1].data
+        color_extract_columns = ['TARGETID', 'SPECTYPE', 'FLUX_G', 'FLUX_R', 'FLUX_Z', 'FLUX_W1', 'FLUX_W2']
+        cigale_extract_columns = ['TARGETID', 'LOGM', 'LOGSFR']
+        fastspecfit_extract_columns = ['TARGETID']
 
+        # Convert the data from each FITS file into a pandas DataFrame
+        df_spectra = Table(spectra_data[1].data).to_pandas()
+        df_color = Table(color_data[1].data).to_pandas()
+        df_cigale = Table(cigale_data[1].data).to_pandas()
+        df_fastspecfit = Table(fastspecfit_data[1].data).to_pandas()
 
-        # Find common TARGETIDs
-        common_ids  = np.intersect1d(sd1_all['TARGETID'], cd1_all['TARGETID'])
-        common_ids  = np.intersect1d(common_ids,  fastspecfit_all['TARGETID'])
-        final_ids   = np.intersect1d(common_ids,       cigale_all['TARGETID'])
-
-        # Create boolean masks for filtering
-        spectra_mask        = np.isin(sd1_all['TARGETID'], final_ids)
-        color_mask          = np.isin(cd1_all['TARGETID'], final_ids)
-        cigale_mask         = np.isin(cigale_all['TARGETID'], final_ids)
-        fastspecfit_mask    = np.isin(fastspecfit_all['TARGETID'], final_ids)
-
-        # Filter the data
-        sd1_filtered            = sd1_all[spectra_mask]
-        cd1_filtered            = cd1_all[color_mask]
-        cigale_filtered         = cigale_all[cigale_mask]
-        fastspecfit_filtered    = fastspecfit_all[fastspecfit_mask]
-
-        # Get the sorting order from one of the filtered arrays
-        sort_order = np.argsort(sd1_filtered['TARGETID'])
-
-        # Apply the same sorting order to all datasets
-        sd1         = sd1_filtered[sort_order]
-        sd2         = spectra_data[2].data[spectra_mask][sort_order]
-        sd3         = spectra_data[3].data[spectra_mask][sort_order]
-        sd4         = spectra_data[4].data[spectra_mask][sort_order]
-        cd1         = cd1_filtered[np.argsort(cd1_filtered['TARGETID'])] # Re-sort to ensure alignment
-        cigale      = cigale_filtered[np.argsort(cigale_filtered['TARGETID'])] # Re-sort to ensure alignment
-        fd2         = fastspecfit_data[2].data[fastspecfit_mask][np.argsort(fastspecfit_filtered['TARGETID'])] # CONTINUUM
-        fd4         = fastspecfit_data[4].data[fastspecfit_mask][np.argsort(fastspecfit_filtered['TARGETID'])] # EMISSION
-
-
-        self.targetID   = np.asarray(sd1['TARGETID'])
-        self.n_spectra  = len(self.targetID)
-        self.z_pipe     = np.asarray(sd1['Z'])
-        self.z          = self.z_pipe.copy()
-        self.RA         = np.asarray(sd1['RA'])
-        self.DEC        = np.asarray(sd1['DEC'])
-        self.coadd_data = np.asarray(sd2[:, 0, :], dtype=np.float32)
-        self.ivar       = np.asarray(sd3[:, 0, :], dtype=np.float32)
-        self.mask       = np.asarray(sd4[:, 0, :], dtype=np.float32)
-        self.spectype   = cd1['SPECTYPE']
-        self.logM       = cigale['LOGM']
-        self.logSFR     = cigale['LOGSFR']
-        self.continuum  = np.asarray(fd2, dtype=np.float32)
-        self.emission   = np.asarray(fd4, dtype=np.float32)
+        # Merge the DataFrames on the 'TARGETID' column
+        # Start with the first DataFrame
+        merged_df = df_spectra
         
-        
-        
-        g = cd1['FLUX_G']; r = cd1['FLUX_R']; z = cd1['FLUX_Z']
-        w1 = cd1['FLUX_W1']; w2 = cd1['FLUX_W2']
-        color_flux = np.column_stack((g, r, z, w1, w2))
+        # Sequentially merge the other DataFrames
+        # Using an inner join to keep only the target IDs present in all files
+        merged_df = pd.merge(merged_df, df_color[color_extract_columns], on='TARGETID', how='inner')
+        merged_df = pd.merge(merged_df, df_cigale[cigale_extract_columns], on='TARGETID', how='inner')
+        merged_df = pd.merge(merged_df, df_fastspecfit[fastspecfit_extract_columns], on='TARGETID', how='inner')
+
+        # Sort by TARGETID to ensure consistent order with array data
+        merged_df = merged_df.sort_values('TARGETID').reset_index(drop=True)
+
+
+        # Store the metadata in the dataframe
+        self.df = merged_df
+        self.targetID = self.df['TARGETID'].to_numpy()
+        self.n_spectra = len(self.targetID)
+
+        # Get the sorting indices to match the dataframe's order
+        # This is necessary because the dataframe is sorted by TARGETID
+        # Create a mapping from the original TARGETID to its index for spectra and fastspecfit data
+        spectra_id_map = {tid: i for i, tid in enumerate(spectra_data[1].data['TARGETID'])}
+        fastspecfit_id_map = {tid: i for i, tid in enumerate(fastspecfit_data[1].data['TARGETID'])}
+
+        # Get the desired order of indices based on the sorted TARGETIDs in the merged dataframe
+        spectra_indices = [spectra_id_map[tid] for tid in self.df['TARGETID']]
+        fastspecfit_indices = [fastspecfit_id_map[tid] for tid in self.df['TARGETID']]
+
+        # Use advanced integer indexing to select and reorder the data in a single step
+        self.coadd_data = np.asarray(spectra_data[2].data[spectra_indices, 0, :], dtype=np.float32)
+        self.ivar       = np.asarray(spectra_data[3].data[spectra_indices, 0, :], dtype=np.float32)
+        self.mask       = np.asarray(spectra_data[4].data[spectra_indices, 0, :], dtype=np.float32)
+        self.continuum  = np.asarray(fastspecfit_data[2].data[fastspecfit_indices], dtype=np.float32)
+        self.emission   = np.asarray(fastspecfit_data[4].data[fastspecfit_indices], dtype=np.float32)
+
+        # Add columns to the dataframe that were previously separate attributes
+        self.df['z_pipe'] = self.df['Z']
+        self.df['z'] = self.df['z_pipe'].copy()
+        self.df.drop(columns=['Z'], inplace=True)
+
+        # Calculate and store color magnitudes
+        color_flux = self.df[['FLUX_G', 'FLUX_R', 'FLUX_Z', 'FLUX_W1', 'FLUX_W2']].to_numpy()
         with np.errstate(divide='ignore', invalid='ignore'):
             color_mag_all = 22.5 - 2.5 * np.log10(color_flux)
+            color_mag_all[np.isinf(color_mag_all)] = np.nan # Handle -inf from log10(0)
+        # self.df['color_mag'] = color_mag_all
+        # self.df.drop(columns=['FLUX_G', 'FLUX_R', 'FLUX_Z', 'FLUX_W1', 'FLUX_W2'], inplace=True)
         self.color_mag = color_mag_all
+
+        # For compatibility with existing methods, create view attributes
+        # These will be updated if the dataframe is modified by other methods
+        # self.z_pipe     = self.df['z_pipe'].to_numpy()
+        # self.z          = self.df['z'].to_numpy()
+        # self.RA         = self.df['RA'].to_numpy()
+        # self.DEC        = self.df['DEC'].to_numpy()
+        # self.spectype   = self.df['SPECTYPE'].to_numpy()
+        # self.logM       = self.df['LOGM'].to_numpy()
+        # self.logSFR     = self.df['LOGSFR'].to_numpy()
         
         
         self.adjust_z_mode = None   # make these lazy if large & rarely used
@@ -238,16 +297,12 @@ class Spectrum:
         # idx may be a boolean mask or integer array
         self.targetID   = self.targetID[idx]
         self.n_spectra  = len(self.targetID)
-        self.z_pipe     = self.z_pipe[idx]
-        self.z          = self.z[idx]
-        self.RA         = self.RA[idx]
-        self.DEC        = self.DEC[idx]
+
+        self.df        = self.df.iloc[idx].reset_index(drop=True)
+        
         self.coadd_data = self.coadd_data[idx]
         self.ivar       = self.ivar[idx]
         self.mask       = self.mask[idx]
-        self.spectype   = self.spectype[idx]
-        self.logM       = self.logM[idx]
-        self.logSFR     = self.logSFR[idx]
         self.continuum  = self.continuum[idx]
         self.emission   = self.emission[idx]
         if hasattr(self, 'data_stack'):     self.data_stack = self.data_stack[idx, :, :]
@@ -259,7 +314,6 @@ class Spectrum:
             else:
                 self.target_label = [self.target_label[i] for i in np.atleast_1d(idx)]
 
-        
         self._id_to_idx = {int(tid): i for i, tid in enumerate(self.targetID)}
     
     def shrink_dataset(self, step: int):
@@ -293,79 +347,43 @@ class Spectrum:
                 # If any ID is not found, raise an error
                 raise ValueError(f"targetID {e.args[0]} not found in the dataset.") from e
 
-    #
-    # Color criteria
-    #
-    def color_criteria(self, blue=True, criterion=None, exclude=False):
-        if blue is None:
-            operators = {
-                '>=': lambda x, y: x >= y,
-                '<=': lambda x, y: x <= y,
-                '>': lambda x, y: x > y,
-                '<': lambda x, y: x < y,
-            }
-            if not any(op in criterion for op in operators.keys()):
-                print(f"Criterion '{criterion}' not recognized. Available criteria: {list(operators.keys())}")
-                return np.array([False] * self.n_spectra)
-            
-            
-            left_color, right_color = criterion.split('-')
-            if any(op in right_color for op in operators.keys()):
-                operator = next(op for op in operators.keys() if op in right_color)
-                right_color, val = right_color.split(operator)
-            else:
-                print(f"Criterion '{criterion}' not recognized. Available criteria: {list(operators.keys())}")
-                return np.array([False] * self.n_spectra)
-            left_mag = self.color_mag[:, {'g': 0, 'r': 1, 'z': 2, 'w1': 3, 'w2': 4}[left_color]]
-            right_mag = self.color_mag[:, {'g': 0, 'r': 1, 'z': 2, 'w1': 3, 'w2': 4}[right_color]]
-            criteria = operators[operator](left_mag - right_mag, float(val))
-        else:
-            distance = c*self.z_pipe / 70  # in Mpc
-            magnitude_distance = 5 * (np.log10(distance * 1e6) - 1)  # in pc
-            mag = self.color_mag[:, 1] - magnitude_distance
-
-            M_sun_r = 4.64  # Absolute magnitude of the Sun in r-band
-            luminosity_r = 10**(-0.4 * (mag - M_sun_r))
-            separation_values = 1.3 * np.exp((np.log10(luminosity_r) - 13) / 1.2) + 0.45
-            criteria = (self.color_mag[:, 0] - self.color_mag[:, 1]) <= separation_values
-            
-        if exclude:
-            criteria = ~criteria
-        return criteria
-
-    def SFG_criteria(self, exclude=False):
-        logM = self.logM
-        logSFR = self.logSFR
+    def SFG_filter(self, exclude=False):
+        logM = self.df['LOGM'].to_numpy()
+        logSFR = self.df['LOGSFR'].to_numpy()
         criteria = logSFR > (1 * (logM - 10) - 3)
 
         if exclude:
             criteria = ~criteria
-        return criteria
+            
+        self.subset(criteria)
+        return self
 
-    def subtype_criteria(self, subtype='QSO', exclude=True):
+    def subtype_filter(self, subtype='QSO', exclude=True):
         
         if subtype.upper() not in ['QSO', 'LRG', 'ELG', 'BGS', 'MWS']:
             print(f"Subtype '{subtype}' not recognized. Available subtypes: ['QSO', 'LRG', 'ELG', 'BGS', 'MWS']")
             return np.array([False] * self.n_spectra)
         
         # simple vectorized comparison
-        is_subtype = (self.spectype == subtype.upper())
+        is_subtype = (self.df['SPECTYPE'].to_numpy() == subtype.upper())
 
         if exclude:
             is_subtype = ~is_subtype
-        return is_subtype
+        
+        self.subset(is_subtype)
+        return self
 
     #
     # Stack data and mask bad pixels for convenience
     #    
     def stack_data(self):
-        n_spectra = self.n_spectra
-        coadd_data = self.coadd_data
-        ivar = self.ivar
-        mask = self.mask
-        continuum = self.continuum
-        emission = self.emission
-        
+        n_spectra   = self.n_spectra
+        coadd_data  = self.coadd_data
+        ivar        = self.ivar
+        mask        = self.mask
+        continuum   = self.continuum
+        emission    = self.emission
+
         
         lam = np.tile(desi_wavelength, (n_spectra, 1))
         data_stack = np.column_stack((lam, coadd_data-continuum, ivar, mask, continuum, emission))
@@ -376,53 +394,35 @@ class Spectrum:
         if not hasattr(self, 'data_stack'):
             self.stack_data()
 
-        n_spectra = self.n_spectra
         data_stack = self.data_stack
-        new_grid = desi_wavelength.copy()
-
-        # Vectorized approach for interpolation
-        # Create a copy of flux and ivar to modify
-        flux_interp = data_stack[:, 1, :].copy()
-        ivar_interp = data_stack[:, 2, :].copy()
 
         # Create a boolean mask for bad pixels
-        bad_mask = (data_stack[:, 3, :] != 0) | (data_stack[:, 2, :] == 0)
+        bad_mask = (data_stack[:, 3, :] != 0) | (data_stack[:, 2, :] <= 0)
 
-        # Set bad pixels to NaN to be ignored by np.interp
-        flux_interp[bad_mask] = np.nan
-        ivar_interp[bad_mask] = np.nan
+        # Use a copy of the flux and ivar to modify
+        flux = data_stack[:, 1, :].copy()
+        ivar = data_stack[:, 2, :].copy()
 
-        # Get the x-coordinates (wavelengths)
-        x_coords = data_stack[:, 0, :]
+        # Set bad pixels to NaN to be handled by pandas' interpolate
+        flux[bad_mask] = np.nan
+        ivar[bad_mask] = np.nan
 
-        # Iterate through each spectrum to perform interpolation
-        # This is necessary because np.interp doesn't handle NaNs in y-values
-        # in a way that allows for a fully vectorized solution for this problem.
-        for i in range(n_spectra):
-            y_flux = flux_interp[i]
-            y_ivar = ivar_interp[i]
-            x = x_coords[i]
-            
-            # Create a mask for the valid (non-NaN) points for this spectrum
-            valid_mask = ~np.isnan(y_flux)
-            
-            # If there are no valid points, fill with zeros. Otherwise, interpolate.
-            if np.any(valid_mask):
-                # Interpolate flux
-                data_stack[i, 1, :] = np.interp(x, x[valid_mask], y_flux[valid_mask])
-                # Interpolate ivar
-                data_stack[i, 2, :] = np.interp(x, x[valid_mask], y_ivar[valid_mask])
-            else:
-                data_stack[i, 1, :] = 0.0
-                data_stack[i, 2, :] = 0.0
+        # Convert to pandas DataFrame for fast, vectorized interpolation
+        df_flux = pd.DataFrame(flux)
+        df_ivar = pd.DataFrame(ivar)
 
-        # Reset the mask array to all zeros as all bad pixels have been handled
+        # Interpolate along rows (axis=1). 'linear' is equivalent to np.interp.
+        # limit_direction='both' fills NaNs at the start and end of the series.
+        df_flux.interpolate(method='linear', axis=1, limit_direction='both', inplace=True)
+        df_ivar.interpolate(method='linear', axis=1, limit_direction='both', inplace=True)
+
+        # Convert back to numpy arrays and update the data_stack
+        # Fill any remaining NaNs (e.g., if a whole spectrum was bad) with 0
+        data_stack[:, 1, :] = df_flux.to_numpy(na_value=0.0)
+        data_stack[:, 2, :] = df_ivar.to_numpy(na_value=0.0)
+
+        # Reset the mask array to all zeros as bad pixels have been handled
         data_stack[:, 3, :] = 0
-        
-        # Ensure the wavelength grid is uniform
-        data_stack[:, 0, :] = new_grid[np.newaxis, :]
-
-        self.data_stack = data_stack
 
 class FitSpectrum:
     def __init__(self,):
@@ -437,7 +437,7 @@ class FitSpectrum:
         n_spectra = data_class.n_spectra
         data_stack = data_class.data_stack
         id2index = data_class.id2index
-        z = data_class.z
+        z = data_class.df['z'].to_numpy()
         
         if hasattr(self, 'shifted') is False:
             self.shifted = np.full(n_spectra, False)
@@ -456,6 +456,7 @@ class FitSpectrum:
                 data_stack[i, 0, :] = desi_wavelength.copy() / (1 + z[i])
             else:
                 data_stack[i, 0, :] = desi_wavelength.copy() / (1 + z[i] + dz)
+                data_class.df.at[i, 'z'] = z[i] + dz
             self.shifted[i] = True
         
         data_class.data_stack = data_stack
@@ -491,29 +492,50 @@ class FitSpectrum:
         OII_crop_region     = [   OII_rest[0]-30,    OII_rest[1]+ 30]
         OIII_crop_region    = [ Hbeta_rest[0]-30,   OIII_rest[1]+ 30]
 
+        crop_region = [OII_crop_region, OIII_crop_region, Halpha_crop_region]
+
         lam, flux, ivar = data_stack[idx, 0, :], data_stack[idx, 1, :], data_stack[idx, 2, :]
 
-        Halpha_slice    = (lam >= Halpha_crop_region[0]) & (lam <= Halpha_crop_region[1])
-        Halpha_lam      = lam[Halpha_slice]
-        Halpha_flux     = flux[Halpha_slice]
-        Halpha_ivar     = ivar[Halpha_slice]
-        Halpha_sigma    = np.sqrt(1/Halpha_ivar)
-        
-        OII_slice       = (lam >= OII_crop_region[0]) & (lam <= OII_crop_region[1])
-        OII_lam         = lam[OII_slice]
-        OII_flux        = flux[OII_slice]
-        OII_ivar        = ivar[OII_slice]
-        OII_sigma       = np.sqrt(1/OII_ivar)
-        
-        OIII_slice       = (lam >= OIII_crop_region[0]) & (lam <= OIII_crop_region[1])
-        OIII_lam         = lam[OIII_slice]
-        OIII_flux        = flux[OIII_slice]
-        OIII_ivar        = ivar[OIII_slice]
-        OIII_sigma       = np.sqrt(1/OIII_ivar)
+        slice_indices = []
+        lams = []
+        fluxes = []
+        sigmas = []
 
-        combine_lam     = np.concatenate([OII_lam, OIII_lam, Halpha_lam])
-        combine_flux    = np.concatenate([OII_flux, OIII_flux, Halpha_flux])
-        combine_sigma   = np.concatenate([OII_sigma, OIII_sigma, Halpha_sigma])
+        for i in range(len(crop_region)):
+            slice_mask = (lam >= crop_region[i][0]) & (lam <= crop_region[i][1])
+            lams.append(lam[slice_mask])
+            fluxes.append(flux[slice_mask])
+            sigmas.append(np.sqrt(1/ivar[slice_mask]))
+            if i == 0:
+                slice_indices.append(0)
+            else:
+                slice_indices.append(slice_indices[i-1] + len(lam[slice_mask]))
+
+        combine_lam     = np.concatenate(lams)
+        combine_flux    = np.concatenate(fluxes)
+        combine_sigma   = np.concatenate(sigmas)
+        
+        # Halpha_slice    = (lam >= Halpha_crop_region[0]) & (lam <= Halpha_crop_region[1])
+        # Halpha_lam      = lam[Halpha_slice]
+        # Halpha_flux     = flux[Halpha_slice]
+        # Halpha_ivar     = ivar[Halpha_slice]
+        # Halpha_sigma    = np.sqrt(1/Halpha_ivar)
+        
+        # OII_slice       = (lam >= OII_crop_region[0]) & (lam <= OII_crop_region[1])
+        # OII_lam         = lam[OII_slice]
+        # OII_flux        = flux[OII_slice]
+        # OII_ivar        = ivar[OII_slice]
+        # OII_sigma       = np.sqrt(1/OII_ivar)
+        
+        # OIII_slice       = (lam >= OIII_crop_region[0]) & (lam <= OIII_crop_region[1])
+        # OIII_lam         = lam[OIII_slice]
+        # OIII_flux        = flux[OIII_slice]
+        # OIII_ivar        = ivar[OIII_slice]
+        # OIII_sigma       = np.sqrt(1/OIII_ivar)
+
+        # combine_lam     = np.concatenate([OII_lam, OIII_lam, Halpha_lam])
+        # combine_flux    = np.concatenate([OII_flux, OIII_flux, Halpha_flux])
+        # combine_sigma   = np.concatenate([OII_sigma, OIII_sigma, Halpha_sigma])
 
         lines_to_fit    = [OII_rest[1], OIII_rest[1], *Hbeta_rest, *Halpha_rest, *NII_rest, *SII_rest]
 
@@ -635,9 +657,9 @@ class FitSpectrum:
                     gaussian_parms_Halpha.append((amp_j, lam0_j, sigma_j)) # Halpha
 
             
-            lam_OII = lam_grid[:len(OII_lam)]
-            lam_OIII = lam_grid[len(OII_lam):len(OII_lam)+len(OIII_lam)]
-            lam_Halpha = lam_grid[len(OII_lam)+len(OIII_lam):]
+            lam_OII = lam_grid[slice_indices[0]:slice_indices[1]]
+            lam_OIII = lam_grid[slice_indices[1]:slice_indices[2]]
+            lam_Halpha = lam_grid[slice_indices[2]:]
 
             combine_model = np.concatenate([
                 model(   lam_OII,    gaussian_parms=gaussian_parms_OII,), # OII
@@ -775,212 +797,92 @@ class FitSpectrum:
                     gaussian_params.append((popt[k+amp_start_index], l_0, sigma_1))
                 params['gaussian_params'] = gaussian_params
         
-        return params, (combine_lam, combine_flux, combine_sigma), (len(OII_lam), len(OIII_lam))
+        return params, (combine_lam, combine_flux, combine_sigma), (slice_indices[1], slice_indices[2])
     
-    
-    def fit_z(self, data_class:Spectrum,
-               id=None,):
-        try:
-            # params_1comp, (combine_lam, combine_flux, combine_sigma), seperation = self.fit_onhs_dz_OII_version(data_class, id=id, two_component=False)
-            params_1comp, (combine_lam, combine_flux, combine_sigma), seperation = self.fit_onhs_dz_modified(data_class, id=id, two_component=False)
+    def adjust_z(self, data_class:Spectrum, id=None):
 
-            conti_1, conti_2    = params_1comp['conti_params']
-            conti_1comp         = np.concatenate([model(combine_lam[:seperation], conti_parms=conti_1), 
-                                                model(combine_lam[seperation:], conti_parms=conti_2)])
-            combine_flux_1comp  = combine_flux - conti_1comp
-            model_1comp         = np.concatenate([model(combine_lam[:seperation], gaussian_parms=params_1comp['gaussian_params']), 
-                                                model(combine_lam[seperation:], gaussian_parms=params_1comp['gaussian_params'])])
-            chisq_1comp         = np.sum(((combine_flux_1comp - model_1comp)/combine_sigma)**2)
-            dof_1comp           = len(combine_lam) - (7+6-4)
-            # 7: dz, sigma_1, conti_a_1, conti_b_1, conti_a_2, conti_b_2, oii_ratio
-            # 6: amp_OII, amp_Halpha, amp_NII*2, amp_SII*2
-            # -4: conti_a_1, conti_b_1, conti_a_2, conti_b_2
+        params_1comp_fixed, (combine_lam, combine_flux, combine_sigma), seperation = self.fit_onhs_dz_modified(data_class, id=id, two_component=False, w_dz=True)
+        OII_sep, OIII_sep = seperation
+        combine_flux_1comp_fixed = combine_flux
+        gaussian_comp = np.concatenate([model(combine_lam[:OII_sep], gaussian_parms=params_1comp_fixed['gaussian_params']), 
+                                        model(combine_lam[OII_sep:OIII_sep+OII_sep], gaussian_parms=params_1comp_fixed['gaussian_params']),
+                                        model(combine_lam[OIII_sep+OII_sep:], gaussian_parms=params_1comp_fixed['gaussian_params'])])
+        model_1comp_fixed = gaussian_comp
+
+        chisq_1comp_fixed = np.sum(((combine_flux_1comp_fixed - model_1comp_fixed)/combine_sigma)**2)
+        dof_1comp_fixed = len(combine_lam) - (2+8)
+        
+        
+
+        params_2comp_fixed, (combine_lam, combine_flux, combine_sigma), seperation = self.fit_onhs_dz_modified(data_class, id=id, two_component=True, w_dz=True)
+        OII_sep, OIII_sep = seperation
+
+        combine_flux_2comp_fixed = combine_flux
+
+        left_comp_dz_fixed = np.concatenate([model(combine_lam[:OII_sep], gaussian_parms=params_2comp_fixed['left_comp'][:2]), 
+                                            model(combine_lam[OII_sep:OIII_sep+OII_sep], gaussian_parms=params_2comp_fixed['left_comp'][2:2+3]),
+                                            model(combine_lam[OIII_sep+OII_sep:], gaussian_parms=params_2comp_fixed['left_comp'][5:])])
+        right_comp_dz_fixed = np.concatenate([model(combine_lam[:OII_sep], gaussian_parms=params_2comp_fixed['right_comp'][:2]), 
+                                            model(combine_lam[OII_sep:OIII_sep+OII_sep], gaussian_parms=params_2comp_fixed['right_comp'][2:2+3]),
+                                            model(combine_lam[OIII_sep+OII_sep:], gaussian_parms=params_2comp_fixed['right_comp'][5:])])
+        model_2comp_fixed = left_comp_dz_fixed + right_comp_dz_fixed
+
+        chisq_2comp_fixed = np.sum(((combine_flux_2comp_fixed - model_2comp_fixed)/combine_sigma)**2)
+        dof_2comp_fixed = len(combine_lam) - (5+8*2)
+        
+        F_stat = ((chisq_1comp_fixed - chisq_2comp_fixed) / (dof_1comp_fixed - dof_2comp_fixed)) / (chisq_2comp_fixed / dof_2comp_fixed)
+        p_value = 1 - f.cdf(F_stat, dof_1comp_fixed - dof_2comp_fixed, dof_2comp_fixed)
+
+        if p_value < 0.05:
+            dz = params_2comp_fixed['dz']
+        else:
+            dz = params_1comp_fixed['dz']
+        
+        data_class = self.shift_to_rest_frame(data_class, id=id, dz=dz)
+        return data_class
+        
+    def find_dp(self, data_class:Spectrum, id=None):
+
+        params_1comp_free, (combine_lam, combine_flux, combine_sigma), seperation = self.fit_onhs_dz_modified(data_class, id=id, two_component=False, w_dz=False)
+        OII_sep, OIII_sep = seperation
+        combine_flux_1comp_free = combine_flux
+        gaussian_comp = np.concatenate([model(combine_lam[:OII_sep], gaussian_parms=params_1comp_free['gaussian_params']), 
+                                        model(combine_lam[OII_sep:OIII_sep+OII_sep], gaussian_parms=params_1comp_free['gaussian_params']),
+                                        model(combine_lam[OIII_sep+OII_sep:], gaussian_parms=params_1comp_free['gaussian_params'])])
+        model_1comp_free = gaussian_comp
+        chisq_1comp_free = np.sum(((combine_flux_1comp_free - model_1comp_free)/combine_sigma)**2)
+        dof_1comp_free = len(combine_lam) - (2+8)
+
+
+        params_2comp_free, (combine_lam, combine_flux, combine_sigma), seperation = self.fit_onhs_dz_modified(data_class, id=id, two_component=True, w_dz=True)
+        OII_sep, OIII_sep = seperation
+        combine_flux_2comp_free = combine_flux
+        left_comp_dz_fixed = np.concatenate([model(combine_lam[:OII_sep], gaussian_parms=params_2comp_free['left_comp'][:2]), 
+                                            model(combine_lam[OII_sep:OIII_sep+OII_sep], gaussian_parms=params_2comp_free['left_comp'][2:2+3]),
+                                            model(combine_lam[OIII_sep+OII_sep:], gaussian_parms=params_2comp_free['left_comp'][5:])])
+        right_comp_dz_fixed = np.concatenate([model(combine_lam[:OII_sep], gaussian_parms=params_2comp_free['right_comp'][:2]), 
+                                            model(combine_lam[OII_sep:OIII_sep+OII_sep], gaussian_parms=params_2comp_free['right_comp'][2:2+3]),
+                                            model(combine_lam[OIII_sep+OII_sep:], gaussian_parms=params_2comp_free['right_comp'][5:])])
+        model_2comp_free = left_comp_dz_fixed + right_comp_dz_fixed
+        chisq_2comp_free = np.sum(((combine_flux_2comp_free - model_2comp_free)/combine_sigma)**2)
+        dof_2comp_free = len(combine_lam) - (5+8*2)
+
+        F_stat = ((chisq_1comp_free - chisq_2comp_free) / (dof_1comp_free - dof_2comp_free)) / (chisq_2comp_free / dof_2comp_free)
+        p_value = 1 - f.cdf(F_stat, dof_1comp_free - dof_2comp_free, dof_2comp_free)
+
+        
+        if p_value > 0.05:
+            pass
+        else:
+            lines_order = ['OII3727', 'OII3729', 'OIII4959', 'OIII5007', 'Hbeta4861', 'Halpha6563', 'NII6548', 'NII6584', 'SII6716', 'SII6731']
+            l0_order = [lines_vac['OII'][0], lines_vac['OII'][1], lines_vac['OIII'][0], lines_vac['OIII'][1], Hbeta_rest[0], Halpha_rest[0], NII_rest[0], NII_rest[1], SII_rest[0], SII_rest[1]]
             
-            criteria = 3 * combine_sigma
             count = 0
-            for comp in params_1comp['gaussian_params']:
-                amp = comp[0]
-                l0 = comp[1]
-                l0_idx = np.searchsorted(combine_lam, l0)
-                if amp > criteria[l0_idx]:
-                    count += 1
-                else:
-                    continue
-            if count >= 2: # significant detection
-                pass
-            else: # noise
-                return f'noise_{count}' 
-        except: # one comp fitting failed
-            return '1_comp_fit_failed' 
-        
-        
-        try:    
-            # params_wdz, (combine_lam, combine_flux, combine_sigma), seperation = self.fit_onhs_dz_OII_version(data_class, id=id, two_component=True, w_dz=True)
-            params_wdz, (combine_lam, combine_flux, combine_sigma), seperation = self.fit_onhs_dz_OII_modified(data_class, id=id, two_component=True, w_dz=True)
+            for idx, l0 in enumerate(l0_order):
+                amp_r, lamc_r, sigma_r  = params_2comp_free['right_comp'][idx]
+                lamr_idx = np.searchsorted(combine_lam, l0) - 1
+                amp_l, lamc_l, sigma_l  = params_2comp_free['left_comp'][idx]
+                laml_idx = np.searchsorted(combine_lam, l0) - 1
+                criteria &= ((amp_r / amp_l > 1/3) or (amp_r / amp_l < 3))
+                criteria &= (amp_r > 3 * combine_sigma[lamr_idx]) and (amp_l > 3 * combine_sigma[laml_idx])
 
-            conti_1, conti_2    = params_wdz['conti_params']
-            conti               = np.concatenate([model(combine_lam[:seperation], conti_parms=conti_1), 
-                                                model(combine_lam[seperation:], conti_parms=conti_2)])
-            combine_flux_wdz    = combine_flux - conti
-            left_wdz            = np.concatenate([model(combine_lam[:seperation], gaussian_parms=params_wdz['left_comp'][:2]), 
-                                                model(combine_lam[seperation:], gaussian_parms=params_wdz['left_comp'][2:])])
-            right_wdz           = np.concatenate([model(combine_lam[:seperation], gaussian_parms=params_wdz['right_comp'][:2]), 
-                                                model(combine_lam[seperation:], gaussian_parms=params_wdz['right_comp'][2:])])
-            model_wdz           = left_wdz + right_wdz
-            chisq_wdz           = np.sum(((combine_flux_wdz - model_wdz)/combine_sigma)**2)
-            dof_2comp           = len(combine_lam) - (10+6*2-4)
-            # 10: dz, sigma_1, sigma_2, dz_r, dz_l, conti_a_1, conti_b_1, conti_a_2, conti_b_2, oii_ratio
-            # 6*2: (amp_OII, amp_Halpha, amp_NII*2, amp_SII*2)*2 two components
-            # -4: conti_a_1, conti_b_1, conti_a_2, conti_b_2
-
-            F_stat = ((chisq_1comp - chisq_wdz) / (dof_1comp - dof_2comp)) / (chisq_wdz / dof_2comp)
-            p_value = 1 - f.cdf(F_stat, dof_1comp - dof_2comp, dof_2comp)
-
-            if p_value < 0.05: # two comp with w_dz is better
-                return params_wdz
-            else: # one comp is enough
-                return params_1comp
-            
-        except: # two comp with w_dz fitting failed
-            try:
-                # params_free, (combine_lam, combine_flux, combine_sigma), seperation = self.fit_onhs_dz_OII_version(data_class, id=id, two_component=True, w_dz=False)
-                params_free, (combine_lam, combine_flux, combine_sigma), seperation = self.fit_onhs_dz_OII_modified(data_class, id=id, two_component=True, w_dz=False)
-
-                conti_1, conti_2    = params_free['conti_params']
-                conti               = np.concatenate([model(combine_lam[:seperation], conti_parms=conti_1), 
-                                                    model(combine_lam[seperation:], conti_parms=conti_2)])
-                combine_flux_free   = combine_flux - conti
-                left_free           = np.concatenate([model(combine_lam[:seperation], gaussian_parms=params_free['left_comp'][:2]), 
-                                                    model(combine_lam[seperation:], gaussian_parms=params_free['left_comp'][2:])])
-                right_free          = np.concatenate([model(combine_lam[:seperation], gaussian_parms=params_free['right_comp'][:2]), 
-                                                    model(combine_lam[seperation:], gaussian_parms=params_free['right_comp'][2:])])
-                model_free          = left_free + right_free
-                chisq_free          = np.sum(((combine_flux_free - model_free)/combine_sigma)**2)
-                dof_free            = len(combine_lam) - (9+6*2-4)
-                # 9: sigma_1, sigma_2, dz_r, dz_l, conti_a_1, conti_b_1, conti_a_2, conti_b_2, oii_ratio
-                # 6*2: (amp_OII, amp_Halpha, amp_NII*2, amp_SII*2)*2 two components
-                # -4: conti_a_1, conti_b_1, conti_a_2, conti_b_2
-
-                F_stat = ((chisq_1comp - chisq_free) / (dof_1comp - dof_free)) / (chisq_free / dof_free)
-                p_value = 1 - f.cdf(F_stat, dof_1comp - dof_free, dof_free)
-                if p_value < 0.05: # two comp with free dlam is better
-                    left_area = np.sum(left_free)
-                    right_area = np.sum(right_free)
-                    dz1, dz2 = params_free['dz']
-                    dz_centroid = (dz2*left_area + dz1*right_area)/(left_area+right_area)
-                    params_free['dz_centroid'] = dz_centroid
-                    return params_free
-                else: # one comp is enough
-                    return params_1comp
-            except: # two comp with free dlam fitting failed
-                return params_1comp
-
-
-
-class PlotSpectrum:
-    def __init__(self, data_class:Spectrum):
-        self.n_spectra     = data_class.n_spectra
-        self.targetID      = data_class.targetID
-        self.z_pipe        = data_class.z_pipe
-        self.z             = data_class.z
-        self.RA            = data_class.RA
-        self.DEC           = data_class.DEC
-        self.coadd_data    = data_class.coadd_data
-        self.ivar          = data_class.ivar
-        self.mask          = data_class.mask
-        self.target_label  = data_class.target_label
-        self.spectype      = data_class.spectype
-        self.color_mag     = data_class.color_mag
-        self.id2index      = data_class.id2index
-
-    def hist_color(self, x='g-z', show=True, save=True, fname=None, **kwargs):
-        if '-' in x:
-            left_color, right_color = x.split('-')
-            left_mag = self.color_mag[:, {'g': 0, 'r': 1, 'z': 2, 'w1': 3, 'w2': 4}[left_color]]
-            right_mag = self.color_mag[:, {'g': 0, 'r': 1, 'z': 2, 'w1': 3, 'w2': 4}[right_color]]
-            x_data = left_mag - right_mag
-        else:
-            x_data = self.color_mag[:, {'g': 0, 'r': 1, 'z': 2, 'w1': 3, 'w2': 4}[x]]
-        
-        plt.figure(figsize=kwargs.get('figsize', (8,6)))
-        
-        plt.hist(x_data, bins=kwargs.get('bins', 30), color=kwargs.get('color', 'blue'), alpha=0.7)
-        plt.xlabel(f'{x}')
-        plt.ylabel('Count')
-        plt.title(f'Histogram of {x}')
-        if save:
-            plt.savefig(fname if fname else f'hist_{x}.png', dpi=300)
-            print(f"Saved histogram as {fname if fname else f'hist_{x}.png'}")
-        if show:
-            plt.show()
-        
-
-    def scat_colors(self, x='g-r', y='g-z', show=True, save=True, fname=None, **kwargs):
-        if '-' in x:
-            left_color, right_color = x.split('-')
-            left_mag = self.color_mag[:, {'g': 0, 'r': 1, 'z': 2, 'w1': 3, 'w2': 4}[left_color]]
-            right_mag = self.color_mag[:, {'g': 0, 'r': 1, 'z': 2, 'w1': 3, 'w2': 4}[right_color]]
-            x_data = left_mag - right_mag
-        else:
-            x_data = self.color_mag[:, {'g': 0, 'r': 1, 'z': 2, 'w1': 3, 'w2': 4}[x]]
-            
-        if '-' in y:
-            left_color, right_color = y.split('-')
-            left_mag = self.color_mag[:, {'g': 0, 'r': 1, 'z': 2, 'w1': 3, 'w2': 4}[left_color]]
-            right_mag = self.color_mag[:, {'g': 0, 'r': 1, 'z': 2, 'w1': 3, 'w2': 4}[right_color]]
-            y_data = left_mag - right_mag
-        else:
-            y_data = self.color_mag[:, {'g': 0, 'r': 1, 'z': 2, 'w1': 3, 'w2': 4}[y]]
-
-        plt.figure(figsize=kwargs.get('figsize', (8,6)))
-        plt.scatter(x_data, y_data, s=kwargs.get('s', 10), c=kwargs.get('c', 'blue'), alpha=kwargs.get('alpha', 0.7))
-        plt.xlabel(f'{x}')
-        plt.ylabel(f'{y}')
-        plt.title(f'Scatter plot of {y} vs {x}')
-        
-        if save:
-            plt.savefig(fname if fname else f'scat_{y}_vs_{x}.png', dpi=300)
-            print(f"Saved scatter plot as {fname if fname else f'scat_{y}_vs_{x}.png'}")
-        if show:
-            plt.show()
-
-    def step_spectrum(self, id, range=None, show=True, save=True, fname=None, **kwargs):
-        i = self.id2index(id)
-
-        lam = desi_wavelength.copy() /  (1 + self.z[i])
-        mask = self.mask[i]
-        flux = self.coadd_data[i]
-        ivar = self.ivar[i]
-        sigma = np.sqrt(1 / ivar)
-
-        
-        if range:
-            crop = (lam > range[0]) & (lam < range[1])
-            lam = lam[crop]
-            flux = flux[crop]
-            sigma = sigma[crop]
-            mask = mask[crop]
-
-        plt.figure(figsize=kwargs.get('figsize', (12,6)))
-        plt.step(lam, flux, where='mid', color=kwargs.get('color', 'black'), label='Flux')
-        plt.plot(lam, sigma, color=kwargs.get('sigma_color', 'red'), linestyle='--', label='sigma')
-        plt.plot(lam, mask*10, color=kwargs.get('mask_color', 'red'), linestyle=':', label='mask')
-        for line_name, line_wavelength in lines_vac.items():
-            for lw in line_wavelength:
-                if lw > np.max(lam) or lw < np.min(lam):
-                    continue
-                else:
-                    plt.axvline(x=lw, color=kwargs.get('line_color', 'darkgreen'), linestyle=':', alpha=0.7)
-                    plt.text(lw+3, np.max(flux)*0.95, line_name, rotation=90, color=kwargs.get('line_color', 'darkgreen'), fontsize=8)
-        
-        plt.xlabel('Rest Wavelength (Å)')
-        plt.ylabel('Flux')
-        plt.title(f'Spectrum of TargetID: {self.targetID[i]} at z={self.z[i]:.4f}')
-        plt.legend()
-        plt.xlim(kwargs.get('xlim', (np.min(lam), np.max(lam))))
-        
-        if save:
-            plt.savefig(fname if fname else f'spectrum_{self.targetID[i]}.png')
-            print(f"Saved spectrum plot as {fname if fname else f'spectrum_{self.targetID[i]}.png'}")
-        if show:
-            plt.show()
