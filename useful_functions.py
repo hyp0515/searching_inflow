@@ -203,7 +203,23 @@ def new_fits(fits_data, targetIDs, fname=None):
         print(f"New FITS file saved as {fname}")
     
     return new_hdul
-    
+
+
+def read_ids(fname):
+    """
+    Read target IDs from a text file.
+
+    Parameters:
+    fname : str
+        Path to the text file containing target IDs.
+
+    Returns:
+    list
+        List of target IDs read from the file.
+    """
+    with open(fname, 'r') as f:
+        targetIDs = [int(line.strip()) for line in f if line.strip().isdigit()]
+    return targetIDs
 
 ################################################################################################################
 class Spectrum:
@@ -233,7 +249,9 @@ class Spectrum:
         # Sort by TARGETID to ensure consistent order with array data
         merged_df = merged_df.sort_values('TARGETID').reset_index(drop=True)
 
-
+        if load_targetID is not None:
+            merged_df = merged_df[merged_df['TARGETID'].isin(load_targetID)].reset_index(drop=True)
+        
         # Store the metadata in the dataframe
         self.df = merged_df
         self.targetID = self.df['TARGETID'].to_numpy()
@@ -315,6 +333,10 @@ class Spectrum:
                 self.target_label = [self.target_label[i] for i in np.atleast_1d(idx)]
 
         self._id_to_idx = {int(tid): i for i, tid in enumerate(self.targetID)}
+        
+        with open('filtered_ids.txt', 'w+') as f:
+            for tid in self.targetID:
+                f.write(f"{tid}\n")
     
     def shrink_dataset(self, step: int):
         self._apply_index(slice(None, None, step))
@@ -462,227 +484,196 @@ class FitSpectrum:
         data_class.data_stack = data_stack
         return data_class
 
-    def significant_emission_filter(self, data_class:Spectrum):
+    def label_emission_lines(self, data_class:Spectrum, s_2_n=3):
         n_spectra = data_class.n_spectra
         data_stack = data_class.data_stack
 
-        filter_mask = np.full(n_spectra, False)
+        OII_labels = []
+        OIII_labels = []
+        Halpha_labels = []
+        NII_labels = []
+        Hbeta_labels = []
         for idx in range(n_spectra):
-            count = 0
-            for l0 in [lines_vac['OIII'][1], lines_vac['Halpha'][0]]:
+            label = []
+            for l0, label in zip([OII_rest[1], OIII_rest[1], Halpha_rest[0], NII_rest[1], Hbeta_rest[0]],
+                                [OII_labels, OIII_labels, Halpha_labels, NII_labels, Hbeta_labels]):
                 l0_idx = np.searchsorted(data_stack[idx,0,:], l0)  - 1
-                if data_stack[idx,5,l0_idx] > 8/data_stack[idx,2,l0_idx]:
-                    count += 1
-            if count > 0:
-                filter_mask[idx] = True
+                if data_stack[idx,5,l0_idx] > s_2_n/data_stack[idx,2,l0_idx]:
+                    label.append(True)
+                else:
+                    label.append(False)
 
+        data_class.df['OII']     = OII_labels
+        data_class.df['OIII']    = OIII_labels
+        data_class.df['Halpha']  = Halpha_labels
+        data_class.df['NII']     = NII_labels
+        data_class.df['Hbeta']   = Hbeta_labels
+
+        return data_class
+        
+    
+    
+    def significant_emission_filter(self, data_class:Spectrum):
+        n_spectra = data_class.n_spectra
+        df = data_class.df
+        filter_mask = (df['OIII'] & df['Halpha'] & df['NII'] & df['Hbeta']).values
         data_class.subset(filter_mask)
         return data_class
 
     #
     # Fit spectrum
     #
-    def fit_onhs_dz_modified(self, data_class:Spectrum, 
-                                 id=None, two_component=False, w_dz=False):
+    def fit_multi_emission(self, data_class:Spectrum, 
+                           id=None, two_component=False, w_dz=False):
         
         data_stack = data_class.data_stack
         idx = data_class.id2index(id)
 
-        Halpha_crop_region  = [Halpha_rest[0]-30,    SII_rest[1]+ 30]
-        OII_crop_region     = [   OII_rest[0]-30,    OII_rest[1]+ 30]
-        OIII_crop_region    = [ Hbeta_rest[0]-30,   OIII_rest[1]+ 30]
+        crop_region     = [
+            [   OII_rest[0]-30,    OII_rest[1]+30], # [OII] doublet
+            [ Hbeta_rest[0]-30,   OIII_rest[1]+30], # Hbeta + [OIII] doublet
+            [   NII_rest[0]-30,    NII_rest[1]+30], # Halpha + [NII] doublet
+            [   SII_rest[0]-30,    SII_rest[1]+30], # [SII] doublet
+        ]
 
-        crop_region = [OII_crop_region, OIII_crop_region, Halpha_crop_region]
-
+        lines_to_fit    = [
+            [(OII_rest[0], OII_rest[1])], 
+            [Hbeta_rest[0], (OIII_rest[0], OIII_rest[1])], 
+            [NII_rest[0], Halpha_rest[0], NII_rest[1]], 
+            [SII_rest[0], SII_rest[1]]
+        ]
+        
+        line_ratios = [
+            1/1.33,  # fixed ratio for [OII]3727/3729
+            1/3.00,  # fixed ratio for [OIII]4959/5007
+            0,
+            0
+        ]
+        
+        
+        nline_regions       = [len(lines_to_fit[i]) for i in range(len(lines_to_fit))]
+        n_lines             = int(np.sum(nline_regions))
+        nline_start_indices = np.concatenate(([0], np.cumsum(nline_regions)[:-1]))
+        
         lam, flux, ivar = data_stack[idx, 0, :], data_stack[idx, 1, :], data_stack[idx, 2, :]
 
         slice_indices = []
         lams = []
         fluxes = []
         sigmas = []
-
         for i in range(len(crop_region)):
             slice_mask = (lam >= crop_region[i][0]) & (lam <= crop_region[i][1])
             lams.append(lam[slice_mask])
             fluxes.append(flux[slice_mask])
             sigmas.append(np.sqrt(1/ivar[slice_mask]))
-            if i == 0:
-                slice_indices.append(0)
-            else:
-                slice_indices.append(slice_indices[i-1] + len(lam[slice_mask]))
+            slice_indices.append(np.sum(slice_mask))
 
+        slice_indices = np.cumsum(slice_indices)
         combine_lam     = np.concatenate(lams)
         combine_flux    = np.concatenate(fluxes)
         combine_sigma   = np.concatenate(sigmas)
-        
-        # Halpha_slice    = (lam >= Halpha_crop_region[0]) & (lam <= Halpha_crop_region[1])
-        # Halpha_lam      = lam[Halpha_slice]
-        # Halpha_flux     = flux[Halpha_slice]
-        # Halpha_ivar     = ivar[Halpha_slice]
-        # Halpha_sigma    = np.sqrt(1/Halpha_ivar)
-        
-        # OII_slice       = (lam >= OII_crop_region[0]) & (lam <= OII_crop_region[1])
-        # OII_lam         = lam[OII_slice]
-        # OII_flux        = flux[OII_slice]
-        # OII_ivar        = ivar[OII_slice]
-        # OII_sigma       = np.sqrt(1/OII_ivar)
-        
-        # OIII_slice       = (lam >= OIII_crop_region[0]) & (lam <= OIII_crop_region[1])
-        # OIII_lam         = lam[OIII_slice]
-        # OIII_flux        = flux[OIII_slice]
-        # OIII_ivar        = ivar[OIII_slice]
-        # OIII_sigma       = np.sqrt(1/OIII_ivar)
 
-        # combine_lam     = np.concatenate([OII_lam, OIII_lam, Halpha_lam])
-        # combine_flux    = np.concatenate([OII_flux, OIII_flux, Halpha_flux])
-        # combine_sigma   = np.concatenate([OII_sigma, OIII_sigma, Halpha_sigma])
-
-        lines_to_fit    = [OII_rest[1], OIII_rest[1], *Hbeta_rest, *Halpha_rest, *NII_rest, *SII_rest]
-
-        if two_component:
-            lam0 = lines_to_fit + lines_to_fit
-        else:
-            lam0 = lines_to_fit
-        
-        
-        oii_ratio   = 1/1.33  # fixed ratio for [OII]3729/3727
-        oiii_ratio  = 1/3.0  # fixed ratio for [OIII]5007/4959
-        
-        def fitting_func(lam_grid, *params):
-            
+        def unpack_params(params):
+            gaussian_parms = [[] for _ in range(len(crop_region))] # OII, OIII, Halpha, SII
+            lam0_adj = 1.0
             if two_component:
                 if w_dz:
                     dz, sigma_1, sigma_2, dz_r, dz_l = params[:5]
                     amp_start_index = 5
+                    lam0_adj += dz
                 else:
                     sigma_1, sigma_2, dz_r, dz_l = params[:4]
                     amp_start_index = 4
+                n_lines_tot = 20
             else:
                 if w_dz:
                     dz, sigma_1 = params[:2]
                     amp_start_index = 2
+                    lam0_adj += dz
                 else:
                     sigma_1 = params[0]
                     amp_start_index = 1
-
-            gaussian_parms_OII      = []
-            gaussian_parms_OIII     = []
-            gaussian_parms_Halpha   = []
-            for j in range(len(lam0)):
-                
-                # ADD [OII] 3727
-                if (j == 0) or (j == (0 + len(lines_to_fit))):
-                    if two_component:
-                        amp_j = oii_ratio * params[j+amp_start_index]
-                        if j==0:
-                            sigma_j = sigma_1
-                            if w_dz:
-                                lam0_j  = OII_rest[0] * (1 + dz + dz_r)
-                            else:
-                                lam0_j  = OII_rest[0] * (1 + dz_r)
-                        else:
-                            sigma_j = sigma_2
-                            if w_dz:
-                                lam0_j  = OII_rest[0] * (1 + dz + dz_l)
-                            else:
-                                lam0_j  = OII_rest[0] * (1 + dz_l)
-                            
-                        gaussian_parms_OII.append((amp_j, lam0_j, sigma_j)) # OII 3727
-                    else:
-                        amp_j = oii_ratio * params[j+amp_start_index]
-                        sigma_j = sigma_1
-                        if w_dz:
-                            lam0_j  = OII_rest[0] * (1 + dz)
-                        else:
-                            lam0_j  = OII_rest[0]
-                        gaussian_parms_OII.append((amp_j, lam0_j, sigma_j)) # OII 3727
-                        
-                        
-                # ADD [OIII] 4959        
-                if (j == 1) or (j == (1 + len(lines_to_fit))):
-                    if two_component:
-                        amp_j = oiii_ratio * params[j+amp_start_index]
-                        if j==0:
-                            sigma_j = sigma_1
-                            if w_dz:
-                                lam0_j  = OII_rest[0] * (1 + dz + dz_r)
-                            else:
-                                lam0_j  = OII_rest[0] * (1 + dz_r)
-                        else:
-                            sigma_j = sigma_2
-                            if w_dz:
-                                lam0_j  = OII_rest[0] * (1 + dz + dz_l)
-                            else:
-                                lam0_j  = OII_rest[0] * (1 + dz_l)
-                            
-                        gaussian_parms_OIII.append((amp_j, lam0_j, sigma_j)) # OIII 4959
-                    else:
-                        amp_j = oiii_ratio * params[j+amp_start_index]
-                        sigma_j = sigma_1
-                        if w_dz:
-                            lam0_j  = OIII_rest[0] * (1 + dz)
-                        else:
-                            lam0_j  = OIII_rest[0]
-                        gaussian_parms_OIII.append((amp_j, lam0_j, sigma_j)) # OIII 4959
-                        
-
-                if two_component:
-                    amp_j   = params[j+amp_start_index]
-                    if j < len(lines_to_fit):
-                        sigma_j = sigma_1
-                        if w_dz:
-                            lam0_j  = lam0[j] * (1 + dz + dz_r)
-                        else:
-                            lam0_j  = lam0[j] * (1 + dz_r)
-                    else:
-                        sigma_j = sigma_2
-                        if w_dz:
-                            lam0_j  = lam0[j] * (1 + dz + dz_l)
-                        else:
-                            lam0_j  = lam0[j] * (1 + dz_l)
+                n_lines_tot = 10
                     
-                else:
-                    amp_j   = params[j+amp_start_index]
-                    sigma_j = sigma_1
-                    if w_dz:
-                        lam0_j  = lam0[j] * (1 + dz)
-                    else:
-                        lam0_j  = lam0[j]
+            gaussian_parms = [[] for _ in range(len(crop_region))] # OII, OIII, Halpha, SII
+            for idx_lines, lines in enumerate(lines_to_fit): # 0:OII, 1:OIII, 2:Halpha, 3:SII
+                for idx_line, line in enumerate(lines):
+                    if not isinstance(line, tuple): # not doublet
+                        if two_component:
+                            # right component
+                            sigma_r = sigma_1
+                            amp_r   = params[idx_line+nline_start_indices[idx_lines]+amp_start_index]
+                            lam0_r  = line * (lam0_adj + dz_r)
+                            gaussian_parms[idx_lines].insert(0, (amp_r, lam0_r, sigma_r))
 
-                if (j == 0) or (j == (0+ len(lines_to_fit))):
-                    gaussian_parms_OII.append((amp_j, lam0_j, sigma_j)) # OII
-                elif (j == 1) or (j == (1+ len(lines_to_fit))) or (j == 2) or (j == (2+ len(lines_to_fit))):
-                    gaussian_parms_OIII.append((amp_j, lam0_j, sigma_j)) # OIII
-                else:
-                    gaussian_parms_Halpha.append((amp_j, lam0_j, sigma_j)) # Halpha
+                            # left component
+                            sigma_l = sigma_2
+                            amp_l   = params[idx_line+nline_start_indices[idx_lines]+n_lines+amp_start_index]
+                            lam0_l  = line * (lam0_adj + dz_l)
+                            gaussian_parms[idx_lines].append((amp_l, lam0_l, sigma_l))
+                        else:
+                            amp   = params[idx_line+nline_start_indices[idx_lines]+amp_start_index]
+                            lam0  = line * lam0_adj
+                            gaussian_parms[idx_lines].insert(0, (amp, lam0, sigma_1))
+                    else: # doublet
+                        line1, line2 = line
+                        
+                        line_ratio = line_ratios[idx_lines]
+                            
+                        if two_component:
+                            sigma_r     = sigma_1
+                            sigma_l     = sigma_2
+                            
+                            amp_1_r     = line_ratio * params[idx_line+nline_start_indices[idx_lines]+amp_start_index]
+                            lam0_1_r    = line1 * (lam0_adj + dz_r)
+                            gaussian_parms[idx_lines].insert(0, (amp_1_r, lam0_1_r, sigma_r))
+                            
+                            amp_2_r  = params[idx_line+nline_start_indices[idx_lines]+amp_start_index]
+                            lam0_2_r = line2 * (lam0_adj + dz_r)
+                            gaussian_parms[idx_lines].insert(0, (amp_2_r, lam0_2_r, sigma_r))
 
+                            amp_1_l  = line_ratio * params[idx_line+nline_start_indices[idx_lines]+n_lines+amp_start_index]
+                            lam0_1_l = line1 * (lam0_adj + dz_l)
+                            gaussian_parms[idx_lines].append((amp_1_l, lam0_1_l, sigma_l))
+
+                            amp_2_l  = params[idx_line+nline_start_indices[idx_lines]+n_lines+amp_start_index]
+                            lam0_2_l = line2 * (lam0_adj + dz_l)
+                            gaussian_parms[idx_lines].append((amp_2_l, lam0_2_l, sigma_l))
+                        else:
+                            amp_1  = line_ratio * params[idx_line+nline_start_indices[idx_lines]+amp_start_index]
+                            lam0_1 = line1 * lam0_adj
+                            gaussian_parms[idx_lines].insert(0, (amp_1, lam0_1, sigma_1))
+
+                            amp_2  = params[idx_line+nline_start_indices[idx_lines]+amp_start_index]
+                            lam0_2 = line2 * lam0_adj
+                            gaussian_parms[idx_lines].insert(0, (amp_2, lam0_2, sigma_1))
+            return gaussian_parms
+
+        def fitting_func(lam_grid, *params):
             
-            lam_OII = lam_grid[slice_indices[0]:slice_indices[1]]
-            lam_OIII = lam_grid[slice_indices[1]:slice_indices[2]]
-            lam_Halpha = lam_grid[slice_indices[2]:]
-
+            lams = [
+                lam_grid[:slice_indices[0]],
+                lam_grid[slice_indices[0]:slice_indices[1]],
+                lam_grid[slice_indices[1]:slice_indices[2]],
+                lam_grid[slice_indices[2]:]
+            ]
+            gaussian_parms = unpack_params(params)
             combine_model = np.concatenate([
-                model(   lam_OII,    gaussian_parms=gaussian_parms_OII,), # OII
-                model(  lam_OIII,   gaussian_parms=gaussian_parms_OIII,), # OIII
-                model(lam_Halpha, gaussian_parms=gaussian_parms_Halpha,) # Halpha
+                model(lams[i], gaussian_parms=gaussian_parms[i]) 
+                for i in range(len(crop_region))
             ])
             return combine_model
+        
 
         dz_init, dz_upper, dz_lower                     = 0, 1e-3, -1e-3
-
         sigma_1_init, sigma_1_upper, sigma_1_lower      = 1, 7/(2*np.sqrt(2*np.log(2))), 2/(2*np.sqrt(2*np.log(2)))
+        amp_init, amp_upper, amp_lower                  = [1]*n_lines, [np.max(combine_flux)]*n_lines, [0]*n_lines
         if two_component:
             sigma_2_init, sigma_2_upper, sigma_2_lower  = sigma_1_init, sigma_1_upper, sigma_1_lower
+            dz_r_init, dz_r_upper, dz_r_lower           =  1e-6, 1e-3,     0     # right component
+            dz_l_init, dz_l_upper, dz_l_lower           = -1e-6,    0, -1e-3     # left component
+            amp_init, amp_upper, amp_lower              = [1]*int(n_lines*2), [np.max(combine_flux)]*int(n_lines*2), [0]*int(n_lines*2)
 
-        if two_component:
-            dz_r_init, dz_r_upper, dz_r_lower              =  1e-6, 1e-3,     0     # right component
-            dz_l_init, dz_l_upper, dz_l_lower              = -1e-6,    0, -1e-3     # left component
-
-
-        amp_init, amp_upper, amp_lower              = [1]*len(lam0), [np.max(combine_flux)]*len(lam0), [0]*len(lam0)
-
-        # oii_ratio_init, oii_ratio_upper, oii_ratio_lower = 0.7518, 0.76, 0.74
-        
         if two_component:
             if w_dz:
                 p0 = [dz_init, sigma_1_init, sigma_2_init, dz_r_init, dz_l_init] + amp_init
@@ -704,104 +695,48 @@ class FitSpectrum:
                 bounds_upper = [sigma_1_upper] + amp_upper
 
         popt, pcov = curve_fit(fitting_func, combine_lam, combine_flux, p0=p0, sigma=combine_sigma, bounds=(bounds_lower, bounds_upper), absolute_sigma=True)
-        
+        print(popt)
         params = {}
         if two_component:
             if w_dz:
                 dz, sigma_1, sigma_2, dz_r, dz_l = popt[:5]
-                amp_start_index = 5
                 params['dz'] = dz
             else:
                 sigma_1, sigma_2, dz_r, dz_l = popt[:4]
-                amp_start_index = 4
-                params['dz'] = (dz_r, dz_l)
+                params['dz'] = 0
             params['dz_centroid'] = None
             params['sigma'] = (sigma_1, sigma_2)
             params['dlam'] = (dz_r, dz_l)
-            params['conti_params'] = ((0, 0), (0, 0), (0, 0))
-            right_comp = []
-            left_comp = []
-            for k, l_0 in enumerate(lam0):
-                # ADD [OII] 3727
-                if (k == 0) or (k == (0 + len(lines_to_fit))):
-                    if w_dz:
-                        if k == 0:
-                            right_comp.append((oii_ratio*popt[k+amp_start_index], OII_rest[0]*(1+dz+dz_r), sigma_1))
-                        else:
-                            left_comp.append((oii_ratio*popt[k+amp_start_index],  OII_rest[0]*(1+dz+dz_l), sigma_2))
-                    else:
-                        if k == 0:
-                            right_comp.append((oii_ratio*popt[k+amp_start_index], OII_rest[0]*(1+dz_r), sigma_1))
-                        else:
-                            left_comp.append((oii_ratio*popt[k+amp_start_index],  OII_rest[0]*(1+dz_l), sigma_2))
-
-                # ADD [OIII] 4959
-                if (k == 1) or (k == (1 + len(lines_to_fit))):
-                    if w_dz:
-                        if k == 1:
-                            right_comp.append((oiii_ratio*popt[k+amp_start_index], OIII_rest[0]*(1+dz+dz_r), sigma_1))
-                        else:
-                            left_comp.append((oiii_ratio*popt[k+amp_start_index],  OIII_rest[0]*(1+dz+dz_l), sigma_2))
-                    else:
-                        if k == 1:
-                            right_comp.append((oiii_ratio*popt[k+amp_start_index], OIII_rest[0]*(1+dz_r), sigma_1))
-                        else:
-                            left_comp.append((oiii_ratio*popt[k+amp_start_index],  OIII_rest[0]*(1+dz_l), sigma_2))
-
-                if w_dz:
-                    if k < len(lines_to_fit):
-                        right_comp.append((popt[k+amp_start_index], l_0*(1+dz+dz_r), sigma_1))
-                    else:
-                        left_comp.append((popt[k+amp_start_index],  l_0*(1+dz+dz_l), sigma_2))
-                else:
-                    if k < len(lines_to_fit):
-                        right_comp.append((popt[k+amp_start_index], l_0*(1+dz_r), sigma_1))
-                    else:
-                        left_comp.append((popt[k+amp_start_index],  l_0*(1+dz_l), sigma_2))
-            params['right_comp'] = right_comp
-            params['left_comp'] = left_comp
-            params['gaussian_params'] = right_comp+left_comp
         else:
             if w_dz:
                 dz, sigma_1 = popt[:2]
-                amp_start_index = 2
                 params['dz'] = dz
                 params['sigma'] = sigma_1
                 params['dlam'] = None
-                params['conti_params'] = ((0, 0), (0, 0), (0, 0))
-                gaussian_params = []
-                for k, l_0 in enumerate(lam0):
-                    # ADD [OII] 3727
-                    if k == 0:
-                        gaussian_params.append((oii_ratio*popt[k+amp_start_index], lines_vac['OII'][0]*(1+dz), sigma_1))
-                    # ADD [OIII] 4959
-                    if k == 1:
-                        gaussian_params.append((oiii_ratio*popt[k+amp_start_index], lines_vac['OIII'][0]*(1+dz), sigma_1))
-                    gaussian_params.append((popt[k+amp_start_index], l_0*(1+dz), sigma_1))
-                params['gaussian_params'] = gaussian_params
             else:
                 sigma_1 = popt[0]
-                amp_start_index = 1
                 params['dz'] = 0
                 params['sigma'] = sigma_1
                 params['dlam'] = None
-                params['conti_params'] = ((0, 0), (0, 0), (0, 0))
-                gaussian_params = []
-                for k, l_0 in enumerate(lam0):
-                    # ADD [OII] 3727
-                    if k == 0:
-                        gaussian_params.append((oii_ratio*popt[k+amp_start_index], lines_vac['OII'][0], sigma_1))
-                    # ADD [OIII] 4959
-                    if k == 1:
-                        gaussian_params.append((oiii_ratio*popt[k+amp_start_index], lines_vac['OIII'][0], sigma_1))
-                    gaussian_params.append((popt[k+amp_start_index], l_0, sigma_1))
-                params['gaussian_params'] = gaussian_params
-        
-        return params, (combine_lam, combine_flux, combine_sigma), (slice_indices[1], slice_indices[2])
+                
+        gaussian_parms = unpack_params(popt)
+        params['gaussian_params'] = gaussian_parms
+
+        if two_component:
+            left_comps= [[] for _ in range(len(crop_region))]
+            right_comps= [[] for _ in range(len(crop_region))]
+            n_lines_per_region = [2, 3, 3, 2]
+            for i, region_line in enumerate(gaussian_parms):
+                n_comps_region = n_lines_per_region[i]
+                right_comps[i] = region_line[:n_comps_region]
+                left_comps[i] = region_line[n_comps_region:]
+            params['left_comp'] = left_comps
+            params['right_comp'] = right_comps
+        return params, (combine_lam, combine_flux, combine_sigma), slice_indices
     
     def adjust_z(self, data_class:Spectrum, id=None):
 
-        params_1comp_fixed, (combine_lam, combine_flux, combine_sigma), seperation = self.fit_onhs_dz_modified(data_class, id=id, two_component=False, w_dz=True)
+        params_1comp_fixed, (combine_lam, combine_flux, combine_sigma), seperation = self.fit_multi_emission(data_class, id=id, two_component=False, w_dz=True)
         OII_sep, OIII_sep = seperation
         combine_flux_1comp_fixed = combine_flux
         gaussian_comp = np.concatenate([model(combine_lam[:OII_sep], gaussian_parms=params_1comp_fixed['gaussian_params']), 
@@ -814,7 +749,7 @@ class FitSpectrum:
         
         
 
-        params_2comp_fixed, (combine_lam, combine_flux, combine_sigma), seperation = self.fit_onhs_dz_modified(data_class, id=id, two_component=True, w_dz=True)
+        params_2comp_fixed, (combine_lam, combine_flux, combine_sigma), seperation = self.fit_multi_emission(data_class, id=id, two_component=True, w_dz=True)
         OII_sep, OIII_sep = seperation
 
         combine_flux_2comp_fixed = combine_flux
@@ -843,7 +778,7 @@ class FitSpectrum:
         
     def find_dp(self, data_class:Spectrum, id=None):
 
-        params_1comp_free, (combine_lam, combine_flux, combine_sigma), seperation = self.fit_onhs_dz_modified(data_class, id=id, two_component=False, w_dz=False)
+        params_1comp_free, (combine_lam, combine_flux, combine_sigma), seperation = self.fit_multi_emission(data_class, id=id, two_component=False, w_dz=False)
         OII_sep, OIII_sep = seperation
         combine_flux_1comp_free = combine_flux
         gaussian_comp = np.concatenate([model(combine_lam[:OII_sep], gaussian_parms=params_1comp_free['gaussian_params']), 
@@ -854,7 +789,7 @@ class FitSpectrum:
         dof_1comp_free = len(combine_lam) - (2+8)
 
 
-        params_2comp_free, (combine_lam, combine_flux, combine_sigma), seperation = self.fit_onhs_dz_modified(data_class, id=id, two_component=True, w_dz=True)
+        params_2comp_free, (combine_lam, combine_flux, combine_sigma), seperation = self.fit_multi_emission(data_class, id=id, two_component=True, w_dz=True)
         OII_sep, OIII_sep = seperation
         combine_flux_2comp_free = combine_flux
         left_comp_dz_fixed = np.concatenate([model(combine_lam[:OII_sep], gaussian_parms=params_2comp_free['left_comp'][:2]), 
