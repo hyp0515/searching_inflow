@@ -520,6 +520,48 @@ class FitSpectrum:
         data_class.subset(filter_mask)
         return data_class
 
+    def line_ratios(self, data_class:Spectrum):
+        n_spectra = data_class.n_spectra
+        data_stack = data_class.data_stack
+        df = data_class.df
+        
+        oiii_hbeta = []
+        nii_halpha = []
+        for idx in range(n_spectra):
+            lam = data_stack[idx, 0, :]
+            flux = data_stack[idx, 1, :]
+            ivar = data_stack[idx, 2, :]
+
+            def get_line_flux(line_rest):
+                line_idx = np.searchsorted(lam, line_rest) - 1
+                line_flux = flux[line_idx]
+                line_ivar = ivar[line_idx]
+                line_sigma = np.sqrt(1/line_ivar)
+                return line_flux, line_sigma
+
+            OIII_5007_flux, OIII_5007_sigma = get_line_flux(OIII_rest[1])
+            OIII_4959_flux, OIII_4959_sigma = get_line_flux(OIII_rest[0])
+            Hbeta_flux, Hbeta_sigma         = get_line_flux(Hbeta_rest[0])
+            NII_6583_flux, NII_6583_sigma   = get_line_flux(NII_rest[1])
+            Halpha_flux, Halpha_sigma       = get_line_flux(Halpha_rest[0])
+
+            OIII_Hbeta_ratio = OIII_5007_flux / Hbeta_flux
+            NII_Halpha_ratio = NII_6583_flux / Halpha_flux
+
+
+            oiii_hbeta.append(OIII_Hbeta_ratio)
+            nii_halpha.append(NII_Halpha_ratio)
+        
+        OIII_Hbeta_ratio = np.array(oiii_hbeta)
+        NII_Halpha_ratio = np.array(nii_halpha)
+        
+        df['OIII_Hbeta_ratio'] = OIII_Hbeta_ratio
+        df['NII_Halpha_ratio'] = NII_Halpha_ratio
+        
+
+        return data_class
+    
+    
     #
     # Fit spectrum
     #
