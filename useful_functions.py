@@ -435,8 +435,8 @@ class Spectrum:
 
         # Interpolate along rows (axis=1). 'linear' is equivalent to np.interp.
         # limit_direction='both' fills NaNs at the start and end of the series.
-        df_flux.interpolate(method='linear', axis=1, limit_direction='both', inplace=True)
-        df_ivar.interpolate(method='linear', axis=1, limit_direction='both', inplace=True)
+        df_flux.interpolate(method='quadratic', axis=1, limit_direction='both', inplace=True)
+        df_ivar.interpolate(method='quadratic', axis=1, limit_direction='both', inplace=True)
 
         # Convert back to numpy arrays and update the data_stack
         # Fill any remaining NaNs (e.g., if a whole spectrum was bad) with 0
@@ -492,11 +492,12 @@ class FitSpectrum:
         OIII_labels = []
         Halpha_labels = []
         NII_labels = []
+        SII_labels = []
         Hbeta_labels = []
         for idx in range(n_spectra):
             label = []
-            for l0, label in zip([OII_rest[1], OIII_rest[1], Halpha_rest[0], NII_rest[1], Hbeta_rest[0]],
-                                [OII_labels, OIII_labels, Halpha_labels, NII_labels, Hbeta_labels]):
+            for l0, label in zip([OII_rest[1], OIII_rest[1], Halpha_rest[0], NII_rest[1], Hbeta_rest[0], SII_rest[0]],
+                                [OII_labels, OIII_labels, Halpha_labels, NII_labels, Hbeta_labels, SII_labels]):
                 l0_idx = np.searchsorted(data_stack[idx,0,:], l0)  - 1
                 if data_stack[idx,5,l0_idx] > s_2_n/data_stack[idx,2,l0_idx]:
                     label.append(True)
@@ -508,6 +509,7 @@ class FitSpectrum:
         data_class.df['Halpha']  = Halpha_labels
         data_class.df['NII']     = NII_labels
         data_class.df['Hbeta']   = Hbeta_labels
+        data_class.df['SII']     = SII_labels
 
         return data_class
         
@@ -516,7 +518,11 @@ class FitSpectrum:
     def significant_emission_filter(self, data_class:Spectrum):
         n_spectra = data_class.n_spectra
         df = data_class.df
-        filter_mask = (df['OIII'] & df['Halpha'] & df['NII'] & df['Hbeta']).values
+        
+        
+        line_columns = ['OII', 'OIII', 'Hbeta', 'Halpha', 'NII', 'SII']
+        detected_line_count = df[line_columns].sum(axis=1)
+        filter_mask = (detected_line_count >= 3).values
         data_class.subset(filter_mask)
         return data_class
 
@@ -570,32 +576,40 @@ class FitSpectrum:
         
         data_stack = data_class.data_stack
         idx = data_class.id2index(id)
+        df = data_class.df.iloc[idx]
+        
+        line_choices = {
+            'OII'       : ([OII_rest[0]-20, OII_rest[1]+20], [(OII_rest[0], OII_rest[1])], 1/1.33),  # fixed ratio for [OII]3727/3729
+            'Hbeta'     : ([Hbeta_rest[0]-20, Hbeta_rest[0]+20], [Hbeta_rest[0]], 0),
+            'OIII'      : ([OIII_rest[0]-20, OIII_rest[1]+20], [(OIII_rest[0], OIII_rest[1])], 1/3.00),  # fixed ratio for [OIII]4959/5007
+            'Halpha'    : ([NII_rest[0]-20, NII_rest[1]+20], [NII_rest[0], Halpha_rest[0], NII_rest[1]], 0),
+            'SII'       : ([SII_rest[0]-20, SII_rest[1]+20], [SII_rest[0], SII_rest[1]], 0)
+        }
+        
+        crop_region = []
+        lines_to_fit = []
+        line_ratios = []
+        for detected_line in ['OII', 'Hbeta', 'OIII', 'Halpha', 'SII']:
+            if bool(df[detected_line]) == True:
+                crop_region.append(line_choices[detected_line][0])
+                lines_to_fit.append(line_choices[detected_line][1])
+                line_ratios.append(line_choices[detected_line][2])
+        
+        def count_lines(region):
+            count = 0
+            for item in region:
+                if isinstance(item, tuple):
+                    count += len(item)
+                else:
+                    count += 1
+            return count
 
-        crop_region     = [
-            [   OII_rest[0]-30,    OII_rest[1]+30], # [OII] doublet
-            [ Hbeta_rest[0]-30,   OIII_rest[1]+30], # Hbeta + [OIII] doublet
-            [   NII_rest[0]-30,    NII_rest[1]+30], # Halpha + [NII] doublet
-            [   SII_rest[0]-30,    SII_rest[1]+30], # [SII] doublet
-        ]
-
-        lines_to_fit    = [
-            [(OII_rest[0], OII_rest[1])], 
-            [Hbeta_rest[0], (OIII_rest[0], OIII_rest[1])], 
-            [NII_rest[0], Halpha_rest[0], NII_rest[1]], 
-            [SII_rest[0], SII_rest[1]]
-        ]
-        
-        line_ratios = [
-            1/1.33,  # fixed ratio for [OII]3727/3729
-            1/3.00,  # fixed ratio for [OIII]4959/5007
-            0,
-            0
-        ]
+        n_lines_total_region = [count_lines(region) for region in lines_to_fit]
         
         
-        nline_regions       = [len(lines_to_fit[i]) for i in range(len(lines_to_fit))]
-        n_lines             = int(np.sum(nline_regions))
-        nline_start_indices = np.concatenate(([0], np.cumsum(nline_regions)[:-1]))
+        n_lines_fit_regions       = [len(lines_to_fit[i]) for i in range(len(lines_to_fit))]
+        n_lines_fit             = int(np.sum(n_lines_fit_regions))
+        nline_start_indices = np.concatenate(([0], np.cumsum(n_lines_fit_regions)[:-1]))
         
         lam, flux, ivar = data_stack[idx, 0, :], data_stack[idx, 1, :], data_stack[idx, 2, :]
 
@@ -610,7 +624,7 @@ class FitSpectrum:
             sigmas.append(np.sqrt(1/ivar[slice_mask]))
             slice_indices.append(np.sum(slice_mask))
 
-        slice_indices = np.cumsum(slice_indices)
+        slice_indices = np.cumsum(slice_indices)[:-1]
         combine_lam     = np.concatenate(lams)
         combine_flux    = np.concatenate(fluxes)
         combine_sigma   = np.concatenate(sigmas)
@@ -650,7 +664,7 @@ class FitSpectrum:
 
                             # left component
                             sigma_l = sigma_2
-                            amp_l   = params[idx_line+nline_start_indices[idx_lines]+n_lines+amp_start_index]
+                            amp_l   = params[idx_line+nline_start_indices[idx_lines]+n_lines_fit+amp_start_index]
                             lam0_l  = line * (lam0_adj + dz_l)
                             gaussian_parms[idx_lines].append((amp_l, lam0_l, sigma_l))
                         else:
@@ -674,11 +688,11 @@ class FitSpectrum:
                             lam0_2_r = line2 * (lam0_adj + dz_r)
                             gaussian_parms[idx_lines].insert(0, (amp_2_r, lam0_2_r, sigma_r))
 
-                            amp_1_l  = line_ratio * params[idx_line+nline_start_indices[idx_lines]+n_lines+amp_start_index]
+                            amp_1_l  = line_ratio * params[idx_line+nline_start_indices[idx_lines]+n_lines_fit+amp_start_index]
                             lam0_1_l = line1 * (lam0_adj + dz_l)
                             gaussian_parms[idx_lines].append((amp_1_l, lam0_1_l, sigma_l))
 
-                            amp_2_l  = params[idx_line+nline_start_indices[idx_lines]+n_lines+amp_start_index]
+                            amp_2_l  = params[idx_line+nline_start_indices[idx_lines]+n_lines_fit+amp_start_index]
                             lam0_2_l = line2 * (lam0_adj + dz_l)
                             gaussian_parms[idx_lines].append((amp_2_l, lam0_2_l, sigma_l))
                         else:
@@ -692,13 +706,7 @@ class FitSpectrum:
             return gaussian_parms
 
         def fitting_func(lam_grid, *params):
-            
-            lams = [
-                lam_grid[:slice_indices[0]],
-                lam_grid[slice_indices[0]:slice_indices[1]],
-                lam_grid[slice_indices[1]:slice_indices[2]],
-                lam_grid[slice_indices[2]:]
-            ]
+            lams = np.split(lam_grid, slice_indices)
             gaussian_parms = unpack_params(params)
             combine_model = np.concatenate([
                 model(lams[i], gaussian_parms=gaussian_parms[i]) 
@@ -709,12 +717,12 @@ class FitSpectrum:
 
         dz_init, dz_upper, dz_lower                     = 0, 1e-3, -1e-3
         sigma_1_init, sigma_1_upper, sigma_1_lower      = 1, 7/(2*np.sqrt(2*np.log(2))), 2/(2*np.sqrt(2*np.log(2)))
-        amp_init, amp_upper, amp_lower                  = [1]*n_lines, [np.max(combine_flux)]*n_lines, [0]*n_lines
+        amp_init, amp_upper, amp_lower                  = [1]*n_lines_fit, [np.max(combine_flux)]*n_lines_fit, [0]*n_lines_fit
         if two_component:
             sigma_2_init, sigma_2_upper, sigma_2_lower  = sigma_1_init, sigma_1_upper, sigma_1_lower
             dz_r_init, dz_r_upper, dz_r_lower           =  1e-6, 1e-3,     0     # right component
             dz_l_init, dz_l_upper, dz_l_lower           = -1e-6,    0, -1e-3     # left component
-            amp_init, amp_upper, amp_lower              = [1]*int(n_lines*2), [np.max(combine_flux)]*int(n_lines*2), [0]*int(n_lines*2)
+            amp_init, amp_upper, amp_lower              = [1]*int(n_lines_fit*2), [np.max(combine_flux)]*int(n_lines_fit*2), [0]*int(n_lines_fit*2)
 
         if two_component:
             if w_dz:
@@ -767,18 +775,18 @@ class FitSpectrum:
         if two_component:
             left_comps= [[] for _ in range(len(crop_region))]
             right_comps= [[] for _ in range(len(crop_region))]
-            n_lines_per_region = [2, 3, 3, 2]
+            # n_lines_total_region = [2, 3, 3, 2]
             for i, region_line in enumerate(gaussian_parms):
-                n_comps_region = n_lines_per_region[i]
+                n_comps_region = n_lines_total_region[i]
                 right_comps[i] = region_line[:n_comps_region]
                 left_comps[i] = region_line[n_comps_region:]
             params['left_comp'] = left_comps
             params['right_comp'] = right_comps
-        return params, (combine_lam, combine_flux, combine_sigma), slice_indices
+        return params, (combine_lam, combine_flux, combine_sigma), slice_indices, n_lines_fit
     
     def adjust_z(self, data_class:Spectrum, id=None):
 
-        params_1comp_fixed, (combine_lam, combine_flux, combine_sigma), seperation = self.fit_multi_emission(data_class, id=id, two_component=False, w_dz=True)
+        params_1comp_fixed, (combine_lam, combine_flux, combine_sigma), seperation, n_lines_fit = self.fit_multi_emission(data_class, id=id, two_component=False, w_dz=True)
         OII_sep, OIII_sep = seperation
         combine_flux_1comp_fixed = combine_flux
         gaussian_comp = np.concatenate([model(combine_lam[:OII_sep], gaussian_parms=params_1comp_fixed['gaussian_params']), 
