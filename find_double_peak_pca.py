@@ -5,7 +5,7 @@ from wpca import PCA, WPCA, EMPCA
 from scipy.interpolate import interp1d
 from matplotlib.widgets import Slider, Button
 from matplotlib.widgets import Button
-
+from tqdm import tqdm
 
 spectra_data    = fits.open('/Users/hyp0515/data/0715_Spring_BGS_ALL_trimmed.fits')
 color_data      = fits.open('/Users/hyp0515/data/0715_Spring_half_BGS_BRIGHT_catalog_with_Flux.fits')
