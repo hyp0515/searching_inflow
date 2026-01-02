@@ -9,3 +9,4 @@ images/*.jpg
 *.npz
 *.png
 *.pkl
+*.csv

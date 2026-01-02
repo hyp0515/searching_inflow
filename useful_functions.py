@@ -414,6 +414,12 @@ class Spectrum:
         self.subset(is_subtype)
         return self
 
+    def z_filter(self, max_z=0.4):
+        z = self.df['z'].to_numpy()
+        criteria = z < max_z
+        self.subset(criteria)
+        return self
+
     #
     # Stack data and mask bad pixels for convenience
     #    
@@ -535,12 +541,11 @@ class FitSpectrum:
     
     
     def significant_emission_filter(self, data_class:Spectrum):
-        n_spectra = data_class.n_spectra
         df = data_class.df
 
         line_columns = ['OII', 'OIII', 'Hbeta', 'Halpha', 'NII', 'SII']
         detected_line_count = df[line_columns].sum(axis=1)
-        filter_mask = (detected_line_count >= 3).values
+        filter_mask = (detected_line_count >= 1).values
         data_class.subset(filter_mask)
         return data_class
 
@@ -604,11 +609,19 @@ class FitSpectrum:
         crop_region = []
         lines_to_fit = []
         line_ratios = []
-        for detected_line in ['OII', 'Hbeta', 'OIII', 'Halpha', 'SII']:
-            if bool(df[detected_line]) == True:
+        processed_halpha_nii = False
+        for detected_line in ['OII', 'Hbeta', 'OIII', 'Halpha', 'NII', 'SII']:
+            if detected_line in ['Halpha', 'NII']:
+                if not processed_halpha_nii and (bool(df['Halpha']) or bool(df['NII'])):
+                    crop_region.append(line_choices['Halpha'][0])
+                    lines_to_fit.append(line_choices['Halpha'][1])
+                    line_ratios.append(line_choices['Halpha'][2])
+                    processed_halpha_nii = True
+            elif bool(df[detected_line]):
                 crop_region.append(line_choices[detected_line][0])
                 lines_to_fit.append(line_choices[detected_line][1])
                 line_ratios.append(line_choices[detected_line][2])
+
         
         def count_lines(region):
             count = 0
@@ -638,7 +651,11 @@ class FitSpectrum:
             sigmas.append(np.sqrt(1/np.abs(ivar[slice_mask])))
             slice_indices.append(np.sum(slice_mask))
 
-        slice_indices = np.cumsum(slice_indices)[:-1]
+        if len(slice_indices) > 1:
+            slice_indices = np.cumsum(slice_indices)[:-1]
+        else:
+            slice_indices = []
+
         combine_lam     = np.concatenate(lams)
         combine_flux    = np.concatenate(fluxes)
         combine_sigma   = np.concatenate(sigmas)
@@ -748,12 +765,12 @@ class FitSpectrum:
 
         dz_init, dz_upper, dz_lower                     = 0, 1e-3, -1e-3
         sigma_1_init, sigma_1_upper, sigma_1_lower      = 70, 300, 30
-        amp_init, amp_upper, amp_lower                  = [1]*n_lines_fit, [np.max(combine_flux)]*n_lines_fit, [0]*n_lines_fit
+        amp_init, amp_upper, amp_lower                  = [np.max(combine_flux)/2]*n_lines_fit, [np.max(combine_flux)]*n_lines_fit, [0]*n_lines_fit
         if two_component:
             sigma_2_init, sigma_2_upper, sigma_2_lower  = sigma_1_init, sigma_1_upper, sigma_1_lower
             dv_r_init, dv_r_upper, dv_r_lower           =  0.5, 500,    0     # right component
             dv_l_init, dv_l_upper, dv_l_lower           = -0.5,   0, -500     # left component
-            amp_init, amp_upper, amp_lower              = [1]*int(n_lines_fit*2), [np.max(combine_flux)]*int(n_lines_fit*2), [0]*int(n_lines_fit*2)
+            amp_init, amp_upper, amp_lower              = [np.max(combine_flux)/2]*int(n_lines_fit*2), [np.max(combine_flux)]*int(n_lines_fit*2), [0]*int(n_lines_fit*2)
 
         if two_component:
             if w_dz:
@@ -785,7 +802,7 @@ class FitSpectrum:
             else:
                 sigma_1, sigma_2, dv_r, dv_l = popt[:4]
                 params['dz'] = 0
-            params['sigma'] = (sigma_1, sigma_2)
+            params['sigma'] = sigma_1, sigma_2
             params['dv'] = (dv_r, dv_l)
         else:
             if w_dz:
@@ -815,7 +832,7 @@ class FitSpectrum:
             params['left_lam0s'], params['right_lam0s'] = split_components(lam0s)
         return params, (combine_lam, combine_flux, combine_sigma), slice_indices, n_lines_fit
 
-        
+    
     def find_dp(self, data_class:Spectrum, id=None):
         data_stack = data_class.data_stack
         if id is not None:
@@ -869,24 +886,97 @@ class FitSpectrum:
             sigmab_region = [np.std(residual_region[i]) for i in range(len(residual_region))]
             
             
+            # Determine which regions were actually fitted
+            detected_line_names = []
+            processed_halpha_nii = False
+            for line in ['OII', 'Hbeta', 'OIII', 'Halpha', 'NII', 'SII']:
+                if line in ['Halpha', 'NII']:
+                    if not processed_halpha_nii and (df['Halpha'] or df['NII']):
+                        detected_line_names.append('Halpha') # Represents the combined region
+                        processed_halpha_nii = True
+                elif df[line]:
+                    detected_line_names.append(line)
+
+            # Now iterate through the detected lines and their corresponding fit results
             dp_lines = []
-            i = 0
-            for detected_line in ['OII', 'Hbeta', 'OIII', 'Halpha', 'SII']:
-                dps = []
-                if bool(df[detected_line]) == True:
-                    left_amp, right_amp = left_amps[i], right_amps[i]
-                    for j in range(len(left_amp)):
-                        dp = False
-                        if (right_amp[j]/left_amp[j] > 1/3 and right_amp[j]/left_amp[j] < 3)\
-                            and (right_amp[j] > 3*sigmab_region[i]) and (left_amp[j] > 3*sigmab_region[i]):
-                            dp = True
-                        dps.append(dp)
+            line_fluxes = []
+            region_idx = 0
+            n_lines_region = [2, 1, 2, 3, 2]
+            for k, line_name in enumerate(['OII', 'Hbeta', 'OIII', 'Halpha', 'SII']):
+                if line_name in detected_line_names:
+                    if line_name == 'Halpha' and 'NII' in detected_line_names:
+                        # This is the combined Halpha/NII region
+                        # We process it once under 'Halpha' and skip for 'NII'
+                        pass
+                    
+                    left_amp_region = left_amps[region_idx]
+                    right_amp_region = right_amps[region_idx]
+                    sigma_b = sigmab_region[region_idx]
+                    
+                    dps = [
+                        (1/3 * la < ra < 3 * la) and (ra > 3 * sigma_b) and (la > 3 * sigma_b)
+                        for la, ra in zip(left_amp_region, right_amp_region)
+                    ]
                     dp_lines.append(dps)
-                    i += 1
+                    
+                    line_fluxes_region = []
+                    for j in range(len(params_2comp['left_comp'][region_idx])):
+                        left_comp_dz_free = np.concatenate([
+                            model_vel(lams[region_idx], gaussian_parms=[params_2comp['left_comp'][region_idx][j]])])
+                        right_comp_dz_free = np.concatenate([
+                            model_vel(lams[region_idx], gaussian_parms=[params_2comp['right_comp'][region_idx][j]])])
+                        model_lam_2comp_free = left_comp_dz_free + right_comp_dz_free
+                        line_fluxes_region.append(np.max(model_lam_2comp_free))
+                    line_fluxes.append(line_fluxes_region)
+                    
+                    region_idx += 1
                 else:
-                    dp_lines.append(None)
+                    dp_lines.append([False]*n_lines_region[k])
+                    line_fluxes.append([0]*n_lines_region[k])
+                    
 
-            return p_value, delta_dv, dp_lines
+            # Flatten the list of lists into a single list of booleans
+            dp_detection = [
+                item
+                for sublist in dp_lines
+                for item in sublist
+            ]
 
-        
-        
+            # Flatten the list of lists into a single list of fluxes
+            line_fluxes_flat = [
+                item
+                for sublist in line_fluxes
+                for item in sublist
+            ]
+
+            # detected_fluxes = np.array(line_fluxes_flat)[line_fluxes_flat!=0]
+            # ranks = np.empty_like(detected_fluxes, dtype=int)
+            # ranks[np.argsort(detected_fluxes)[::-1]] = np.arange(len(detected_fluxes))
+            
+            # line_fluxes_rank = np.full(len(line_fluxes_flat), -1, dtype=int)
+            # line_fluxes_rank[line_fluxes_flat!=0] = ranks
+            # Convert to numpy array for boolean indexing and calculations
+            line_fluxes_flat = np.array(line_fluxes_flat)
+            
+            # Create an array to store ranks, initialized to -1
+            line_fluxes_rank = np.full(line_fluxes_flat.shape, -1, dtype=int)
+            
+            # Get the indices of non-zero fluxes
+            non_zero_indices = np.where(line_fluxes_flat > 0)[0]
+            
+            # If there are non-zero fluxes, rank them
+            if non_zero_indices.size > 0:
+                # Get the fluxes that are not zero
+                detected_fluxes = line_fluxes_flat[non_zero_indices]
+                
+                # Get the indices that would sort the detected fluxes in descending order
+                sorted_indices_of_detected = np.argsort(detected_fluxes)[::-1]
+                
+                # Create the ranks (0 for the highest flux, 1 for the second, etc.)
+                ranks = np.arange(len(detected_fluxes))
+                
+                # Place the ranks back into the correct positions in the full rank array
+                # The original indices of the detected fluxes are used to place the ranks.
+                # The ranks are ordered according to the sorted detected fluxes.
+                line_fluxes_rank[non_zero_indices[sorted_indices_of_detected]] = ranks
+            return p_value, delta_dv, dp_detection, line_fluxes_rank, params_2comp
