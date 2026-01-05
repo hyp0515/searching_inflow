@@ -155,7 +155,7 @@ def image_link(RA, DEC, save_image=False, fname=None, plot=False):
     if save_image:
         side_arcmin = 0.5
         scale = np.round(side_arcmin / 3, 6)
-        url = f'https://www.legacysurvey.org/viewer/cutout.jpg?ra={RA}&dec={DEC}&pixscale={scale}&layer=ls-dr10-grz&size=200'
+        url = f'https://www.legacysurvey.org/viewer/cutout.jpg?ra={RA}&dec={DEC}&pixscale={scale}&layer=hsc-dr3&size=200'
         with requests.get(url, stream=True, timeout=(10, 30)) as r:
             r.raise_for_status()
             with open(fname if fname else "cutout.jpg", "wb") as f:
@@ -168,7 +168,8 @@ def image_link(RA, DEC, save_image=False, fname=None, plot=False):
         plt.imshow(plt.imread(fname if fname else "cutout.jpg"))
         plt.axis('off')
         plt.show()
-    return f'https://www.legacysurvey.org/viewer?ra={RA}&dec={DEC}&layer=ls-dr10-grz&zoom=14'
+    
+    return f'https://www.legacysurvey.org/viewer?ra={RA}&dec={DEC}&layer=hsc-dr3&zoom=14'
 
 def spectrum_link(targetID): 
     return f'https://www.legacysurvey.org/viewer/desi-spectrum/dr1/targetid{targetID}'
@@ -524,7 +525,7 @@ class FitSpectrum:
             for l0, label in zip([OII_rest[1], OIII_rest[1], Halpha_rest[0], NII_rest[1], Hbeta_rest[0], SII_rest[0]],
                                 [OII_labels, OIII_labels, Halpha_labels, NII_labels, Hbeta_labels, SII_labels]):
                 l0_idx = np.searchsorted(data_stack[idx,0,:], l0)  - 1
-                if data_stack[idx,5,l0_idx] > s_2_n/data_stack[idx,2,l0_idx]:
+                if data_stack[idx,5,l0_idx] > s_2_n/np.sqrt(np.abs(data_stack[idx,2,l0_idx])):
                     label.append(True)
                 else:
                     label.append(False)
@@ -597,6 +598,8 @@ class FitSpectrum:
         data_stack = data_class.data_stack
         idx = data_class.id2index(id)
         df = data_class.df.iloc[idx]
+        z_pipe = float(df['z_pipe'])
+        
         
         line_choices = {
             'OII'       : ([OII_rest[0]-20, OII_rest[1]+20], [(OII_rest[0], OII_rest[1])], 1/1.33),  # fixed ratio for [OII]3727/3729
@@ -638,17 +641,19 @@ class FitSpectrum:
         n_lines_fit         = int(np.sum(n_lines_fit_regions))
         nline_start_indices = np.concatenate(([0], np.cumsum(n_lines_fit_regions)[:-1]))
         
-        lam, flux, ivar = data_stack[idx, 0, :], data_stack[idx, 1, :], data_stack[idx, 2, :]
+        lam, flux, ivar, conti = data_stack[idx, 0, :], data_stack[idx, 1, :], data_stack[idx, 2, :], data_stack[idx, 4, :]
 
         slice_indices = []
         lams = []
         fluxes = []
         sigmas = []
+        contis = []
         for i in range(len(crop_region)):
             slice_mask = (lam >= crop_region[i][0]) & (lam <= crop_region[i][1])
             lams.append(lam[slice_mask])
             fluxes.append(flux[slice_mask])
             sigmas.append(np.sqrt(1/np.abs(ivar[slice_mask])))
+            contis.append(conti[slice_mask])
             slice_indices.append(np.sum(slice_mask))
 
         if len(slice_indices) > 1:
@@ -659,6 +664,7 @@ class FitSpectrum:
         combine_lam     = np.concatenate(lams)
         combine_flux    = np.concatenate(fluxes)
         combine_sigma   = np.concatenate(sigmas)
+        combine_conti   = np.concatenate(contis)
 
         def unpack_params(params):
             gaussian_parms = [[] for _ in range(len(crop_region))] # OII, OIII, Halpha, SII
@@ -688,24 +694,33 @@ class FitSpectrum:
                     if not isinstance(line, tuple): # not doublet
                         if two_component:
                             # right component
-                            sigma_r = sigma_1
+                            
                             amp_r   = params[idx_line+nline_start_indices[idx_lines]+amp_start_index]
                             lam0_r  = line * lam0_adj
-                            gaussian_parms[idx_lines].insert(0, (amp_r, lam0_r, dv_r, sigma_r))
+                            sigma_r_res     = c * 0.8/(lam0_r*(1+z_pipe))
+                            sigma_r_v       = sigma_1
+                            sigma_r_combine = np.sqrt(sigma_r_v**2 + sigma_r_res**2)
+                            gaussian_parms[idx_lines].insert(0, (amp_r, lam0_r, dv_r, sigma_r_combine))
                             amps[idx_lines].insert(0, amp_r)
                             lam0s[idx_lines].insert(0, lam0_r)
 
                             # left component
-                            sigma_l = sigma_2
+                            
                             amp_l   = params[idx_line+nline_start_indices[idx_lines]+n_lines_fit+amp_start_index]
                             lam0_l  = line * lam0_adj
-                            gaussian_parms[idx_lines].append((amp_l, lam0_l, dv_l, sigma_l))
+                            sigma_l_res     = c * 0.8/(lam0_l*(1+z_pipe))
+                            sigma_l_v       = sigma_2
+                            sigma_l_combine = np.sqrt(sigma_l_v**2 + sigma_l_res**2)
+                            gaussian_parms[idx_lines].append((amp_l, lam0_l, dv_l, sigma_l_combine))
                             amps[idx_lines].append(amp_l)
                             lam0s[idx_lines].append(lam0_l)
                         else:
                             amp   = params[idx_line+nline_start_indices[idx_lines]+amp_start_index]
                             lam0  = line * lam0_adj
-                            gaussian_parms[idx_lines].insert(0, (amp, lam0, 0, sigma_1))
+                            sigma_res       = c * 0.8/(lam0*(1+z_pipe))
+                            sigma_v         = sigma_1
+                            sigma_combine   = np.sqrt(sigma_v**2 + sigma_res**2)
+                            gaussian_parms[idx_lines].insert(0, (amp, lam0, 0, sigma_combine))
                             amps[idx_lines].insert(0, amp)
                             lam0s[idx_lines].insert(0, lam0)
                     else: # doublet
@@ -713,42 +728,59 @@ class FitSpectrum:
                         line_ratio = line_ratios[idx_lines]
                             
                         if two_component:
-                            sigma_r     = sigma_1
-                            sigma_l     = sigma_2
                             
                             amp_1_r     = line_ratio * params[idx_line+nline_start_indices[idx_lines]+amp_start_index]
                             lam0_1_r    = line1 * lam0_adj
-                            gaussian_parms[idx_lines].insert(0, (amp_1_r, lam0_1_r, dv_r, sigma_r))
+                            sigma_1_r_res     = c * 0.8/(lam0_1_r*(1+z_pipe))
+                            sigma_1_r_v       = sigma_1
+                            sigma_1_r_combine = np.sqrt(sigma_1_r_v**2 + sigma_1_r_res**2)
+                            gaussian_parms[idx_lines].insert(0, (amp_1_r, lam0_1_r, dv_r, sigma_1_r_combine))
                             amps[idx_lines].insert(0, amp_1_r)
                             lam0s[idx_lines].insert(0, lam0_1_r)
 
                             amp_2_r     = params[idx_line+nline_start_indices[idx_lines]+amp_start_index]
                             lam0_2_r    = line2 * lam0_adj
-                            gaussian_parms[idx_lines].insert(0, (amp_2_r, lam0_2_r, dv_r, sigma_r))
+                            sigma_2_r_res     = c * 0.8/(lam0_2_r*(1+z_pipe))
+                            sigma_2_r_v       = sigma_1
+                            sigma_2_r_combine = np.sqrt(sigma_2_r_v**2 + sigma_2_r_res**2)
+                            gaussian_parms[idx_lines].insert(0, (amp_2_r, lam0_2_r, dv_r, sigma_2_r_combine))
                             amps[idx_lines].insert(0, amp_2_r)
                             lam0s[idx_lines].insert(0, lam0_2_r)
 
+                            
                             amp_1_l     = line_ratio * params[idx_line+nline_start_indices[idx_lines]+n_lines_fit+amp_start_index]
                             lam0_1_l    = line1 * lam0_adj
-                            gaussian_parms[idx_lines].append((amp_1_l, lam0_1_l, dv_l, sigma_l))
+                            sigma_1_l_res     = c * 0.8/(lam0_1_l*(1+z_pipe))
+                            sigma_1_l_v       = sigma_2
+                            sigma_1_l_combine = np.sqrt(sigma_1_l_v**2 + sigma_1_l_res**2)
+                            gaussian_parms[idx_lines].append((amp_1_l, lam0_1_l, dv_l, sigma_1_l_combine))
                             amps[idx_lines].append(amp_1_l)
                             lam0s[idx_lines].append(lam0_1_l)
 
                             amp_2_l     = params[idx_line+nline_start_indices[idx_lines]+n_lines_fit+amp_start_index]
                             lam0_2_l    = line2 * lam0_adj
-                            gaussian_parms[idx_lines].append((amp_2_l, lam0_2_l, dv_l, sigma_l))
+                            sigma_2_l_res     = c * 0.8/(lam0_2_l*(1+z_pipe))
+                            sigma_2_l_v       = sigma_2
+                            sigma_2_l_combine = np.sqrt(sigma_2_l_v**2 + sigma_2_l_res**2)
+                            gaussian_parms[idx_lines].append((amp_2_l, lam0_2_l, dv_l, sigma_2_l_combine))
                             amps[idx_lines].append(amp_2_l)
                             lam0s[idx_lines].append(lam0_2_l)
                         else:
                             amp_1       = line_ratio * params[idx_line+nline_start_indices[idx_lines]+amp_start_index]
                             lam0_1      = line1 * lam0_adj
-                            gaussian_parms[idx_lines].insert(0, (amp_1, lam0_1, 0, sigma_1))
+                            sigma_1_res     = c * 0.8/(lam0_1*(1+z_pipe))
+                            sigma_1_v       = sigma_1
+                            sigma_1_combine = np.sqrt(sigma_1_v**2 + sigma_1_res**2)
+                            gaussian_parms[idx_lines].insert(0, (amp_1, lam0_1, 0, sigma_1_combine))
                             amps[idx_lines].insert(0, amp_1)
                             lam0s[idx_lines].insert(0, lam0_1)
 
                             amp_2       = params[idx_line+nline_start_indices[idx_lines]+amp_start_index]
                             lam0_2      = line2 * lam0_adj
-                            gaussian_parms[idx_lines].insert(0, (amp_2, lam0_2, 0, sigma_1))
+                            sigma_2_v       = sigma_1
+                            sigma_2_res     = c * 0.8/(lam0_2*(1+z_pipe))
+                            sigma_2_combine = np.sqrt(sigma_2_v**2 + sigma_2_res**2)
+                            gaussian_parms[idx_lines].insert(0, (amp_2, lam0_2, 0, sigma_2_combine))
                             amps[idx_lines].insert(0, amp_2)
                             lam0s[idx_lines].insert(0, lam0_2)
             return gaussian_parms, amps, lam0s
@@ -764,13 +796,13 @@ class FitSpectrum:
         
 
         dz_init, dz_upper, dz_lower                     = 0, 1e-3, -1e-3
-        sigma_1_init, sigma_1_upper, sigma_1_lower      = 70, 300, 30
-        amp_init, amp_upper, amp_lower                  = [np.max(combine_flux)/2]*n_lines_fit, [np.max(combine_flux)]*n_lines_fit, [0]*n_lines_fit
+        sigma_1_init, sigma_1_upper, sigma_1_lower      = 30, 300, 0.01
+        amp_init, amp_upper, amp_lower                  = [np.max(combine_flux+combine_conti)/2]*n_lines_fit, [np.max(combine_flux+combine_conti)]*n_lines_fit, [0]*n_lines_fit
         if two_component:
             sigma_2_init, sigma_2_upper, sigma_2_lower  = sigma_1_init, sigma_1_upper, sigma_1_lower
-            dv_r_init, dv_r_upper, dv_r_lower           =  0.5, 500,    0     # right component
-            dv_l_init, dv_l_upper, dv_l_lower           = -0.5,   0, -500     # left component
-            amp_init, amp_upper, amp_lower              = [np.max(combine_flux)/2]*int(n_lines_fit*2), [np.max(combine_flux)]*int(n_lines_fit*2), [0]*int(n_lines_fit*2)
+            dv_r_init, dv_r_upper, dv_r_lower           =  5, 500,    0     # right component
+            dv_l_init, dv_l_upper, dv_l_lower           = -5,   0, -500     # left component
+            amp_init, amp_upper, amp_lower              = [np.max(combine_flux+combine_conti)/2]*int(n_lines_fit*2), [np.max(combine_flux+combine_conti)]*int(n_lines_fit*2), [0]*int(n_lines_fit*2)
 
         if two_component:
             if w_dz:
