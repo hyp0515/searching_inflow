@@ -243,15 +243,14 @@ def read_ids(fname):
 ################################################################################################################
 class Spectrum:
 
-    def __init__(self, spectra_data, color_data, cigale_data, fastspecfit_data, load_targetID=None):
+    def __init__(self, spectra_data, cigale_data, fastspecfit_data, load_targetID=None):
 
-        color_extract_columns = ['TARGETID', 'SPECTYPE', 'FLUX_G', 'FLUX_R', 'FLUX_Z', 'FLUX_W1', 'FLUX_W2']
-        cigale_extract_columns = ['TARGETID', 'LOGM', 'LOGSFR']
+        cigale_extract_columns = ['TARGETID', 'SPECTYPE', 'LOGM', 'LOGSFR', 
+                                  'FLUX_G', 'FLUX_R', 'FLUX_W1', 'FLUX_W2', 'FLUX_Z']
         fastspecfit_extract_columns = ['TARGETID']
 
         # Convert the data from each FITS file into a pandas DataFrame
         df_spectra = Table(spectra_data[1].data).to_pandas()
-        df_color = Table(color_data[1].data).to_pandas()
         df_cigale = Table(cigale_data[1].data).to_pandas()
         df_fastspecfit = Table(fastspecfit_data[1].data).to_pandas()
 
@@ -261,7 +260,6 @@ class Spectrum:
         
         # Sequentially merge the other DataFrames
         # Using an inner join to keep only the target IDs present in all files
-        merged_df = pd.merge(merged_df, df_color[color_extract_columns], on='TARGETID', how='inner')
         merged_df = pd.merge(merged_df, df_cigale[cigale_extract_columns], on='TARGETID', how='inner')
         merged_df = pd.merge(merged_df, df_fastspecfit[fastspecfit_extract_columns], on='TARGETID', how='inner')
 
@@ -303,25 +301,9 @@ class Spectrum:
         with np.errstate(divide='ignore', invalid='ignore'):
             color_mag_all = 22.5 - 2.5 * np.log10(color_flux)
             color_mag_all[np.isinf(color_mag_all)] = np.nan # Handle -inf from log10(0)
-        # self.df['color_mag'] = color_mag_all
-        # self.df.drop(columns=['FLUX_G', 'FLUX_R', 'FLUX_Z', 'FLUX_W1', 'FLUX_W2'], inplace=True)
-        self.df.drop(columns=['FLUX_W1', 'FLUX_W2'], inplace=True)
+        self.df.drop(columns=['FLUX_G', 'FLUX_R', 'FLUX_Z', 'FLUX_W1', 'FLUX_W2'], inplace=True)
         self.color_mag = color_mag_all
-
-        # For compatibility with existing methods, create view attributes
-        # These will be updated if the dataframe is modified by other methods
-        # self.z_pipe     = self.df['z_pipe'].to_numpy()
-        # self.z          = self.df['z'].to_numpy()
-        # self.RA         = self.df['RA'].to_numpy()
-        # self.DEC        = self.df['DEC'].to_numpy()
-        # self.spectype   = self.df['SPECTYPE'].to_numpy()
-        # self.logM       = self.df['LOGM'].to_numpy()
-        # self.logSFR     = self.df['LOGSFR'].to_numpy()
         
-        
-        self.adjust_z_mode = None   # make these lazy if large & rarely used
-        self.searched_NaD  = None
-        self.target_label  = None
         self._id_to_idx = {int(tid): i for i, tid in enumerate(self.targetID)}
     
     def add_attribute(self, name, value):
@@ -346,11 +328,6 @@ class Spectrum:
         if hasattr(self, 'data_stack'):     self.data_stack = self.data_stack[idx, :, :]
         if hasattr(self, "color_mag"):      self.color_mag = self.color_mag[idx]
         if hasattr(self, "smoothed_flux"):  self.smoothed_flux = self.smoothed_flux[idx]
-        if hasattr(self, "target_label") and self.target_label is not None:
-            if isinstance(idx, np.ndarray) and idx.dtype == bool:
-                self.target_label = [lbl for lbl, keep in zip(self.target_label, idx) if keep]
-            else:
-                self.target_label = [self.target_label[i] for i in np.atleast_1d(idx)]
 
         self._id_to_idx = {int(tid): i for i, tid in enumerate(self.targetID)}
         
@@ -429,10 +406,10 @@ class Spectrum:
         coadd_data  = self.coadd_data
         ivar        = self.ivar
         mask        = self.mask
+        mask        = mask.astype(int) | np.where(ivar <= 0, 1, 0)
         continuum   = self.continuum
         emission    = self.emission
 
-        
         lam = np.tile(desi_wavelength, (n_spectra, 1))
         data_stack = np.column_stack((lam, coadd_data-continuum, ivar, mask, continuum, emission))
         data_stack = data_stack.reshape(n_spectra, 6, -1)
@@ -475,6 +452,40 @@ class Spectrum:
 class FitSpectrum:
     def __init__(self,):
         pass
+
+    def mask_bad_pixel(self, array_to_mask, mask):
+        bad_mask = (mask != 0)
+        array_clean = array_to_mask[~bad_mask]
+        
+        return array_clean
+
+    def unmask_bad_pixel(self, array_clean, mask, fill_value=np.nan):
+        """
+        Reconstructs an array to its original shape before masking,
+        inserting a fill value for the masked pixels.
+
+        Parameters:
+        array_clean : np.ndarray
+            The 1D array of clean data (bad pixels removed).
+        mask : np.ndarray
+            The original mask array where non-zero values indicate bad pixels.
+        fill_value : float, optional
+            The value to insert for the bad pixels, by default np.nan.
+
+        Returns:
+        np.ndarray
+            The reconstructed array with the same shape as the mask.
+        """
+        # Create an array of the original shape, filled with the fill_value
+        unmasked_array = np.full(mask.shape, fill_value, dtype=np.float64)
+        
+        # Identify the locations of the good pixels
+        good_mask = (mask == 0)
+        
+        # Place the clean data into the good pixel locations
+        unmasked_array[good_mask] = array_clean
+        
+        return unmasked_array
     
     #
     # Shift to rest frame
@@ -524,8 +535,11 @@ class FitSpectrum:
             label = []
             for l0, label in zip([OII_rest[1], OIII_rest[1], Halpha_rest[0], NII_rest[1], Hbeta_rest[0], SII_rest[0]],
                                 [OII_labels, OIII_labels, Halpha_labels, NII_labels, Hbeta_labels, SII_labels]):
-                l0_idx = np.searchsorted(data_stack[idx,0,:], l0)  - 1
-                if data_stack[idx,5,l0_idx] > s_2_n/np.sqrt(np.abs(data_stack[idx,2,l0_idx])):
+                lam         = self.mask_bad_pixel(data_stack[idx, 0, :], data_stack[idx, 3, :])
+                emission    = self.mask_bad_pixel(data_stack[idx, 5, :], data_stack[idx, 3, :])
+                ivar        = self.mask_bad_pixel(data_stack[idx, 2, :], data_stack[idx, 3, :])
+                l0_idx      = np.searchsorted(lam, l0)  - 1
+                if emission[l0_idx] > s_2_n/np.sqrt(ivar[l0_idx]):
                     label.append(True)
                 else:
                     label.append(False)
@@ -540,7 +554,6 @@ class FitSpectrum:
         return data_class
         
     
-    
     def significant_emission_filter(self, data_class:Spectrum):
         df = data_class.df
 
@@ -550,47 +563,6 @@ class FitSpectrum:
         data_class.subset(filter_mask)
         return data_class
 
-    def line_ratios(self, data_class:Spectrum):
-        n_spectra = data_class.n_spectra
-        data_stack = data_class.data_stack
-        df = data_class.df
-        
-        oiii_hbeta = []
-        nii_halpha = []
-        for idx in range(n_spectra):
-            lam = data_stack[idx, 0, :]
-            flux = data_stack[idx, 1, :]
-            ivar = data_stack[idx, 2, :]
-
-            def get_line_flux(line_rest):
-                line_idx = np.searchsorted(lam, line_rest) - 1
-                line_flux = flux[line_idx]
-                line_ivar = ivar[line_idx]
-                line_sigma = np.sqrt(1/line_ivar)
-                return line_flux, line_sigma
-
-            OIII_5007_flux, OIII_5007_sigma = get_line_flux(OIII_rest[1])
-            OIII_4959_flux, OIII_4959_sigma = get_line_flux(OIII_rest[0])
-            Hbeta_flux, Hbeta_sigma         = get_line_flux(Hbeta_rest[0])
-            NII_6583_flux, NII_6583_sigma   = get_line_flux(NII_rest[1])
-            Halpha_flux, Halpha_sigma       = get_line_flux(Halpha_rest[0])
-
-            OIII_Hbeta_ratio = OIII_5007_flux / Hbeta_flux
-            NII_Halpha_ratio = NII_6583_flux / Halpha_flux
-
-
-            oiii_hbeta.append(OIII_Hbeta_ratio)
-            nii_halpha.append(NII_Halpha_ratio)
-        
-        OIII_Hbeta_ratio = np.array(oiii_hbeta)
-        NII_Halpha_ratio = np.array(nii_halpha)
-        
-        df['OIII_Hbeta_ratio'] = OIII_Hbeta_ratio
-        df['NII_Halpha_ratio'] = NII_Halpha_ratio
-        
-
-        return data_class
-    
 
     def fit_multi_emission_vel(self, data_class:Spectrum, 
                                id=None, two_component=False, w_dz=False):
@@ -642,6 +614,10 @@ class FitSpectrum:
         nline_start_indices = np.concatenate(([0], np.cumsum(n_lines_fit_regions)[:-1]))
         
         lam, flux, ivar, conti = data_stack[idx, 0, :], data_stack[idx, 1, :], data_stack[idx, 2, :], data_stack[idx, 4, :]
+        lam     = self.mask_bad_pixel(lam, data_stack[idx, 3, :])
+        flux    = self.mask_bad_pixel(flux, data_stack[idx, 3, :])
+        ivar    = self.mask_bad_pixel(ivar, data_stack[idx, 3, :])
+        conti   = self.mask_bad_pixel(conti, data_stack[idx, 3, :])
 
         slice_indices = []
         lams = []
