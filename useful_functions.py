@@ -415,40 +415,6 @@ class Spectrum:
         data_stack = data_stack.reshape(n_spectra, 6, -1)
         self.add_attribute('data_stack', data_stack)
 
-    def mask_bad(self):
-        if not hasattr(self, 'data_stack'):
-            self.stack_data()
-
-        data_stack = self.data_stack
-
-        # Create a boolean mask for bad pixels
-        bad_mask = (data_stack[:, 3, :] != 0) | (data_stack[:, 2, :] <= 0)
-
-        # Use a copy of the flux and ivar to modify
-        flux = data_stack[:, 1, :].copy()
-        ivar = data_stack[:, 2, :].copy()
-
-        # Set bad pixels to NaN to be handled by pandas' interpolate
-        flux[bad_mask] = np.nan
-        ivar[bad_mask] = np.nan
-
-        # Convert to pandas DataFrame for fast, vectorized interpolation
-        df_flux = pd.DataFrame(flux)
-        df_ivar = pd.DataFrame(ivar)
-
-        # Interpolate along rows (axis=1). 'linear' is equivalent to np.interp.
-        # limit_direction='both' fills NaNs at the start and end of the series.
-        df_flux.interpolate(method='quadratic', axis=1, limit_direction='both', inplace=True)
-        df_ivar.interpolate(method='quadratic', axis=1, limit_direction='both', inplace=True)
-
-        # Convert back to numpy arrays and update the data_stack
-        # Fill any remaining NaNs (e.g., if a whole spectrum was bad) with 0
-        data_stack[:, 1, :] = df_flux.to_numpy(na_value=0.0)
-        data_stack[:, 2, :] = df_ivar.to_numpy(na_value=0.0)
-
-        # Reset the mask array to all zeros as bad pixels have been handled
-        data_stack[:, 3, :] = 0
-
 class FitSpectrum:
     def __init__(self,):
         pass
@@ -570,7 +536,7 @@ class FitSpectrum:
         data_stack = data_class.data_stack
         idx = data_class.id2index(id)
         df = data_class.df.iloc[idx]
-        z_pipe = float(df['z_pipe'])
+        z = float(df['z'])
         
         
         line_choices = {
@@ -673,7 +639,7 @@ class FitSpectrum:
                             
                             amp_r   = params[idx_line+nline_start_indices[idx_lines]+amp_start_index]
                             lam0_r  = line * lam0_adj
-                            sigma_r_res     = c * 0.8/(lam0_r*(1+z_pipe))
+                            sigma_r_res     = c * 0.8/(lam0_r*(1+z))
                             sigma_r_v       = sigma_1
                             sigma_r_combine = np.sqrt(sigma_r_v**2 + sigma_r_res**2)
                             gaussian_parms[idx_lines].insert(0, (amp_r, lam0_r, dv_r, sigma_r_combine))
@@ -684,7 +650,7 @@ class FitSpectrum:
                             
                             amp_l   = params[idx_line+nline_start_indices[idx_lines]+n_lines_fit+amp_start_index]
                             lam0_l  = line * lam0_adj
-                            sigma_l_res     = c * 0.8/(lam0_l*(1+z_pipe))
+                            sigma_l_res     = c * 0.8/(lam0_l*(1+z))
                             sigma_l_v       = sigma_2
                             sigma_l_combine = np.sqrt(sigma_l_v**2 + sigma_l_res**2)
                             gaussian_parms[idx_lines].append((amp_l, lam0_l, dv_l, sigma_l_combine))
@@ -693,7 +659,7 @@ class FitSpectrum:
                         else:
                             amp   = params[idx_line+nline_start_indices[idx_lines]+amp_start_index]
                             lam0  = line * lam0_adj
-                            sigma_res       = c * 0.8/(lam0*(1+z_pipe))
+                            sigma_res       = c * 0.8/(lam0*(1+z))
                             sigma_v         = sigma_1
                             sigma_combine   = np.sqrt(sigma_v**2 + sigma_res**2)
                             gaussian_parms[idx_lines].insert(0, (amp, lam0, 0, sigma_combine))
@@ -707,7 +673,7 @@ class FitSpectrum:
                             
                             amp_1_r     = line_ratio * params[idx_line+nline_start_indices[idx_lines]+amp_start_index]
                             lam0_1_r    = line1 * lam0_adj
-                            sigma_1_r_res     = c * 0.8/(lam0_1_r*(1+z_pipe))
+                            sigma_1_r_res     = c * 0.8/(lam0_1_r*(1+z))
                             sigma_1_r_v       = sigma_1
                             sigma_1_r_combine = np.sqrt(sigma_1_r_v**2 + sigma_1_r_res**2)
                             gaussian_parms[idx_lines].insert(0, (amp_1_r, lam0_1_r, dv_r, sigma_1_r_combine))
@@ -716,7 +682,7 @@ class FitSpectrum:
 
                             amp_2_r     = params[idx_line+nline_start_indices[idx_lines]+amp_start_index]
                             lam0_2_r    = line2 * lam0_adj
-                            sigma_2_r_res     = c * 0.8/(lam0_2_r*(1+z_pipe))
+                            sigma_2_r_res     = c * 0.8/(lam0_2_r*(1+z))
                             sigma_2_r_v       = sigma_1
                             sigma_2_r_combine = np.sqrt(sigma_2_r_v**2 + sigma_2_r_res**2)
                             gaussian_parms[idx_lines].insert(0, (amp_2_r, lam0_2_r, dv_r, sigma_2_r_combine))
@@ -726,7 +692,7 @@ class FitSpectrum:
                             
                             amp_1_l     = line_ratio * params[idx_line+nline_start_indices[idx_lines]+n_lines_fit+amp_start_index]
                             lam0_1_l    = line1 * lam0_adj
-                            sigma_1_l_res     = c * 0.8/(lam0_1_l*(1+z_pipe))
+                            sigma_1_l_res     = c * 0.8/(lam0_1_l*(1+z))
                             sigma_1_l_v       = sigma_2
                             sigma_1_l_combine = np.sqrt(sigma_1_l_v**2 + sigma_1_l_res**2)
                             gaussian_parms[idx_lines].append((amp_1_l, lam0_1_l, dv_l, sigma_1_l_combine))
@@ -735,7 +701,7 @@ class FitSpectrum:
 
                             amp_2_l     = params[idx_line+nline_start_indices[idx_lines]+n_lines_fit+amp_start_index]
                             lam0_2_l    = line2 * lam0_adj
-                            sigma_2_l_res     = c * 0.8/(lam0_2_l*(1+z_pipe))
+                            sigma_2_l_res     = c * 0.8/(lam0_2_l*(1+z))
                             sigma_2_l_v       = sigma_2
                             sigma_2_l_combine = np.sqrt(sigma_2_l_v**2 + sigma_2_l_res**2)
                             gaussian_parms[idx_lines].append((amp_2_l, lam0_2_l, dv_l, sigma_2_l_combine))
@@ -744,7 +710,7 @@ class FitSpectrum:
                         else:
                             amp_1       = line_ratio * params[idx_line+nline_start_indices[idx_lines]+amp_start_index]
                             lam0_1      = line1 * lam0_adj
-                            sigma_1_res     = c * 0.8/(lam0_1*(1+z_pipe))
+                            sigma_1_res     = c * 0.8/(lam0_1*(1+z))
                             sigma_1_v       = sigma_1
                             sigma_1_combine = np.sqrt(sigma_1_v**2 + sigma_1_res**2)
                             gaussian_parms[idx_lines].insert(0, (amp_1, lam0_1, 0, sigma_1_combine))
@@ -754,7 +720,7 @@ class FitSpectrum:
                             amp_2       = params[idx_line+nline_start_indices[idx_lines]+amp_start_index]
                             lam0_2      = line2 * lam0_adj
                             sigma_2_v       = sigma_1
-                            sigma_2_res     = c * 0.8/(lam0_2*(1+z_pipe))
+                            sigma_2_res     = c * 0.8/(lam0_2*(1+z))
                             sigma_2_combine = np.sqrt(sigma_2_v**2 + sigma_2_res**2)
                             gaussian_parms[idx_lines].insert(0, (amp_2, lam0_2, 0, sigma_2_combine))
                             amps[idx_lines].insert(0, amp_2)
@@ -810,7 +776,7 @@ class FitSpectrum:
             else:
                 sigma_1, sigma_2, dv_r, dv_l = popt[:4]
                 params['dz'] = 0
-            params['sigma'] = sigma_1, sigma_2
+            params['sigma'] = (sigma_1, sigma_2)
             params['dv'] = (dv_r, dv_l)
         else:
             if w_dz:
