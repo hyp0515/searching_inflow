@@ -58,15 +58,21 @@ class FitSpectrum:
             for l0, label in zip([OII_rest[1], OIII_rest[1], Halpha_rest[0], NII_rest[1], Hbeta_rest[0], SII_rest[0]],
                                 [OII_labels, OIII_labels, Halpha_labels, NII_labels, Hbeta_labels, SII_labels]):
                 lam         = self.mask_bad_pixel(data_stack[idx, 0, :], data_stack[idx, 3, :])
-                emission    = self.mask_bad_pixel(data_stack[idx, 5, :], data_stack[idx, 3, :])
+                emission    = self.mask_bad_pixel(data_stack[idx, 1, :], data_stack[idx, 3, :])
                 ivar        = self.mask_bad_pixel(data_stack[idx, 2, :], data_stack[idx, 3, :])
                 l0_idx      = np.searchsorted(lam, l0)  - 1
-                if emission[l0_idx] > s_2_n/np.sqrt(ivar[l0_idx]):
+
+                crop_flux = emission[(lam >= l0 - 2) & (lam <= l0 + 2)]
+                line_flux = np.max(crop_flux) if len(crop_flux) > 0 else 0
+
+                if line_flux >= s_2_n/np.sqrt(ivar[l0_idx]):
                     label.append(True)
                 else:
                     if l0 == OII_rest[1]:
                         l0_idx      = np.searchsorted(lam, OII_rest[0])  - 1
-                        if emission[l0_idx] > s_2_n/np.sqrt(ivar[l0_idx]):
+                        crop_flux = emission[(lam >= OII_rest[0] - 2) & (lam <= OII_rest[0] + 2)]
+                        line_flux = np.max(crop_flux) if len(crop_flux) > 0 else 0
+                        if line_flux >= s_2_n/np.sqrt(ivar[l0_idx]):
                             label.append(True)
                         else:
                             label.append(False)
@@ -122,6 +128,10 @@ class FitSpectrum:
                     line_ratios.append(line_choices['Halpha'][2])
                     processed_halpha_nii = True
             elif bool(df[detected_line]):
+                crop_region.append(line_choices[detected_line][0])
+                lines_to_fit.append(line_choices[detected_line][1])
+                line_ratios.append(line_choices[detected_line][2])
+            else: # for testing
                 crop_region.append(line_choices[detected_line][0])
                 lines_to_fit.append(line_choices[detected_line][1])
                 line_ratios.append(line_choices[detected_line][2])

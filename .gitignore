@@ -10,5 +10,5 @@ images/*.jpg
 *.png
 *.pkl
 *.csv
-.fits
-sample_catalog.fits
+*.fits
+*/*.fits

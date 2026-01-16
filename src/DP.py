@@ -30,9 +30,8 @@ class DP:
         params_1comp, (combine_lam, combine_flux, combine_sigma), slice_indices, n_lines_fit = FIT.fit_multi_emission_vel(data_class=data_class, id=id, two_component=False, w_dz=False)
         lams = np.split(combine_lam, slice_indices)
         model_1comp = np.concatenate([
-                    model_vel(lams[i], gaussian_parms=params_1comp['gaussian_params'][i]) 
-                    for i in range(len(lams))
-                ])
+            model_vel(lams[i], gaussian_parms=params_1comp['gaussian_params'][i]) for i in range(len(lams))
+        ])
         residual_1comp = combine_flux - model_1comp
         
         
@@ -54,7 +53,7 @@ class DP:
 
 
     
-        # Criteria 2: |dv_r-dv_l| > 3 vel_resolution or 200 km/s
+        # Criteria 2: |dv_r-dv_l| > 3 vel_resolution
         dv_r, dv_l = params_2comp['dv_r'], params_2comp['dv_l']
         delta_dv = np.abs(dv_r - dv_l)
         
@@ -63,7 +62,8 @@ class DP:
         right_amps = params_2comp['right_amps']
         
         residual_region = np.split(residual_2comp, slice_indices)
-        sigmab_region = [np.std(residual_region[i]) for i in range(len(residual_region))]
+        # sigmab_region = [np.std(residual_region[i]) for i in range(len(residual_region))]
+        sigmab_region = [np.mean(combine_sigma[i]) for i in range(len(combine_sigma))]
         
         
         # Determine which regions were actually fitted
@@ -75,6 +75,8 @@ class DP:
                     detected_line_names.append('Halpha') # Represents the combined region
                     processed_halpha_nii = True
             elif df[line]:
+                detected_line_names.append(line)
+            else: # for testing
                 detected_line_names.append(line)
 
         # Now iterate through the detected lines and their corresponding fit results
@@ -193,9 +195,9 @@ class DP:
         results = Parallel(n_jobs=n_jobs)(delayed(process_target)(target_id) for target_id in tqdm(data_class.targetID))
         # Use joblib to parallelize the processing
         dp_parent = pd.DataFrame(results)
-        dp_candidate = dp_parent[(dp_parent['p_value'] < 0.05) & (dp_parent['dv_r']-dp_parent['dv_l'] > 75)].copy()
-        
-        
+        dp_candidate = dp_parent[(dp_parent['p_value'] < 0.05) & (dp_parent['dv_r']-dp_parent['dv_l'] > 3*c*0.8/(Halpha_rest[0]*(1+dp_parent['Z'])))].copy()
+
+
         def get_dp_info(row):
             """
             Identifies consecutive double peaks starting from the brightest emission line.
@@ -243,14 +245,16 @@ class DP:
         dp_sample = dp_candidate[(dp_candidate['dp_count'] > 0)].copy()
 
         dp_parent.drop(columns=dp_cols+dp_rank_cols, inplace=True)
-        dp_candidate.drop(columns=dp_cols+dp_rank_cols, inplace=True)
+        dp_candidate.drop(columns=dp_rank_cols, inplace=True)
         dp_sample.drop(columns=dp_rank_cols, inplace=True)
 
         # Update dp_cols in dp_sample to reflect only the consecutive DPs
         for col in dp_cols:
             line_name = col[:-3]
+            dp_candidate[col] = dp_candidate['dp_lines'].apply(lambda lines: line_name in lines)
             dp_sample[col] = dp_sample['dp_lines'].apply(lambda lines: line_name in lines)
 
+        dp_candidate.drop(['dp_count', 'dp_lines'], axis=1, inplace=True)
         dp_sample.drop(['dp_count', 'dp_lines'], axis=1, inplace=True)
 
         return dp_parent, dp_candidate, dp_sample
@@ -290,7 +294,7 @@ class DP:
         hdul = fits.HDUList()
         hdul.append(fits.PrimaryHDU())
         hdul.append(fits.BinTableHDU(data=df.to_records(index=False), name='DATA'))
-        hdul.append(fits.ImageHDU(data=np.array([res[0] for res in results]), name='1COMP'))
-        hdul.append(fits.ImageHDU(data=np.array([res[1] for res in results]), name='2COMP_L'))
-        hdul.append(fits.ImageHDU(data=np.array([res[2] for res in results]), name='2COMP_R'))
+        hdul.append(fits.ImageHDU(data=np.array([res[0] for res in results]).astype(np.float32), name='1COMP'))
+        hdul.append(fits.ImageHDU(data=np.array([res[1] for res in results]).astype(np.float32), name='2COMP_L'))
+        hdul.append(fits.ImageHDU(data=np.array([res[2] for res in results]).astype(np.float32), name='2COMP_R'))
         hdul.writeto(fname, overwrite=True)
