@@ -119,22 +119,28 @@ class FitSpectrum:
         crop_region = []
         lines_to_fit = []
         line_ratios = []
-        processed_halpha_nii = False
-        for detected_line in ['OII', 'Hbeta', 'OIII', 'Halpha', 'NII', 'SII']:
-            if detected_line in ['Halpha', 'NII']:
-                if not processed_halpha_nii and (bool(df['Halpha']) or bool(df['NII'])):
-                    crop_region.append(line_choices['Halpha'][0])
-                    lines_to_fit.append(line_choices['Halpha'][1])
-                    line_ratios.append(line_choices['Halpha'][2])
-                    processed_halpha_nii = True
-            elif bool(df[detected_line]):
-                crop_region.append(line_choices[detected_line][0])
-                lines_to_fit.append(line_choices[detected_line][1])
-                line_ratios.append(line_choices[detected_line][2])
-            else: # for testing
-                crop_region.append(line_choices[detected_line][0])
-                lines_to_fit.append(line_choices[detected_line][1])
-                line_ratios.append(line_choices[detected_line][2])
+        # processed_halpha_nii = False
+        # for detected_line in ['OII', 'Hbeta', 'OIII', 'Halpha', 'NII', 'SII']:
+        #     if detected_line in ['Halpha', 'NII']:
+        #         if not processed_halpha_nii and (bool(df['Halpha']) or bool(df['NII'])):
+        #             crop_region.append(line_choices['Halpha'][0])
+        #             lines_to_fit.append(line_choices['Halpha'][1])
+        #             line_ratios.append(line_choices['Halpha'][2])
+        #             processed_halpha_nii = True
+        #     # elif bool(df[detected_line]):
+        #     #     crop_region.append(line_choices[detected_line][0])
+        #     #     lines_to_fit.append(line_choices[detected_line][1])
+        #     #     line_ratios.append(line_choices[detected_line][2])
+        #     else: # for testing
+        #         crop_region.append(line_choices[detected_line][0])
+        #         lines_to_fit.append(line_choices[detected_line][1])
+        #         line_ratios.append(line_choices[detected_line][2])
+        
+        
+        for detected_line in ['OII', 'Hbeta', 'OIII', 'Halpha', 'SII']:
+            crop_region.append(line_choices[detected_line][0])
+            lines_to_fit.append(line_choices[detected_line][1])
+            line_ratios.append(line_choices[detected_line][2])
 
         
         def count_lines(region):
@@ -201,10 +207,10 @@ class FitSpectrum:
                     sigma_1 = params[0]
                     amp_start_index = 1
                     
-            gaussian_parms = [[] for _ in range(len(crop_region))] # OII, OIII, Halpha, SII
+            gaussian_parms = [[] for _ in range(len(crop_region))]
             amps = [[] for _ in range(len(crop_region))]
             lam0s = [[] for _ in range(len(crop_region))]
-            for idx_lines, lines in enumerate(lines_to_fit): # 0:OII, 1:OIII, 2:Halpha, 3:SII
+            for idx_lines, lines in enumerate(lines_to_fit):
                 for idx_line, line in enumerate(lines):
                     if not isinstance(line, tuple): # not doublet
                         if two_component:
@@ -311,7 +317,7 @@ class FitSpectrum:
         
 
         dz_init, dz_upper, dz_lower                     = 0, 1e-3, -1e-3
-        sigma_1_init, sigma_1_upper, sigma_1_lower      = 30, 300, 0.01
+        sigma_1_init, sigma_1_upper, sigma_1_lower      = 30, 500, 0.01
         amp_init, amp_upper, amp_lower                  = [np.max(combine_flux+combine_conti)/2]*n_lines_fit, [np.max(combine_flux+combine_conti)]*n_lines_fit, [0]*n_lines_fit
         if two_component:
             sigma_2_init, sigma_2_upper, sigma_2_lower  = sigma_1_init, sigma_1_upper, sigma_1_lower

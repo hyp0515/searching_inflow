@@ -21,11 +21,29 @@ class DP:
             for tid in df['TARGETID']:
                 f.write(f"{tid}\n")
 
-    def fit_dp(self, data_class:Spectrum, id=None):
-        
-        data_stack = data_class.data_stack
+    def reconstruct_fit(self, data_class:Spectrum, id=None):
         idx = data_class.id2index(id)
-        df = data_class.df.iloc[idx]
+        lam = data_class.data_stack[idx, 0, :]
+
+
+        params_1comp, _, slice_indices, _ = FIT.fit_multi_emission_vel(data_class=data_class, id=id, two_component=False, w_dz=False)
+        model_1comp = np.sum([
+                    model_vel(lam, gaussian_parms=params_1comp['gaussian_params'][i]) 
+                    for i in range(len(slice_indices)+1)
+                ], axis=0)
+
+
+        params_2comp, _, slice_indices, _ = FIT.fit_multi_emission_vel(data_class=data_class, id=id, two_component=True, w_dz=False)
+        left_2comp = np.sum([
+            model_vel(lam, gaussian_parms=params_2comp['left_comp'][i]) for i in range(len(slice_indices)+1)
+        ], axis=0)
+
+        right_2comp = np.sum([
+            model_vel(lam, gaussian_parms=params_2comp['right_comp'][i]) for i in range(len(slice_indices)+1)
+        ], axis=0)
+        return model_1comp, left_2comp, right_2comp
+    
+    def fit_dp(self, data_class:Spectrum, id=None):
         
         params_1comp, (combine_lam, combine_flux, combine_sigma), slice_indices, n_lines_fit = FIT.fit_multi_emission_vel(data_class=data_class, id=id, two_component=False, w_dz=False)
         lams = np.split(combine_lam, slice_indices)
@@ -62,79 +80,40 @@ class DP:
         right_amps = params_2comp['right_amps']
         
         residual_region = np.split(residual_2comp, slice_indices)
-        # sigmab_region = [np.std(residual_region[i]) for i in range(len(residual_region))]
-        sigmab_region = [np.mean(combine_sigma[i]) for i in range(len(combine_sigma))]
+        sigmab_region = [np.std(residual_region[i]) for i in range(len(residual_region))]
+        # sigmab_region = [np.mean(combine_sigma[i]) for i in range(len(combine_sigma))]
         
         
-        # Determine which regions were actually fitted
-        detected_line_names = []
-        processed_halpha_nii = False
-        for line in ['OII', 'Hbeta', 'OIII', 'Halpha', 'NII', 'SII']:
-            if line in ['Halpha', 'NII']:
-                if not processed_halpha_nii and (df['Halpha'] or df['NII']):
-                    detected_line_names.append('Halpha') # Represents the combined region
-                    processed_halpha_nii = True
-            elif df[line]:
-                detected_line_names.append(line)
-            else: # for testing
-                detected_line_names.append(line)
+        left_amps  = params_2comp['left_amps']
+        right_amps = params_2comp['right_amps']
 
-        # Now iterate through the detected lines and their corresponding fit results
-        dp_lines = []
+        residual_region = np.split(residual_2comp, slice_indices)
+        sigmab_region = [np.std(residual_region[i]) for i in range(len(residual_region))]
+
+        dp_detections = []
         line_fluxes = []
-        region_idx = 0
-        n_lines_region = [2, 1, 2, 3, 2]
-        for k, line_name in enumerate(['OII', 'Hbeta', 'OIII', 'Halpha', 'SII']):
-            if line_name in detected_line_names:
-                if line_name == 'Halpha' and 'NII' in detected_line_names:
-                    # This is the combined Halpha/NII region
-                    # We process it once under 'Halpha' and skip for 'NII'
-                    pass
-                
-                left_amp_region = left_amps[region_idx]
-                right_amp_region = right_amps[region_idx]
-                sigma_b = sigmab_region[region_idx]
-                
-                dps = [ 
-                    # Criteria 3: 1/3 < Amp1/Amp2 < 3
-                    # Criteria 4: amp > 3 * sigma_b
-                    (1/3 * la < ra < 3 * la) and (ra > 3 * sigma_b) and (la > 3 * sigma_b)
-                    for la, ra in zip(left_amp_region, right_amp_region)
-                ]
-                dp_lines.append(dps)
-                
-                line_fluxes_region = []
-                for j in range(len(params_2comp['left_comp'][region_idx])):
-                    left_comp_dz_free = np.concatenate([
-                        model_vel(lams[region_idx], gaussian_parms=[params_2comp['left_comp'][region_idx][j]])])
-                    right_comp_dz_free = np.concatenate([
-                        model_vel(lams[region_idx], gaussian_parms=[params_2comp['right_comp'][region_idx][j]])])
-                    model_lam_2comp_free = left_comp_dz_free + right_comp_dz_free
-                    line_fluxes_region.append(np.max(model_lam_2comp_free))
-                line_fluxes.append(line_fluxes_region)
-                
-                region_idx += 1
-            else:
-                dp_lines.append([False]*n_lines_region[k])
-                line_fluxes.append([0]*n_lines_region[k])
-                
+        for k, _ in enumerate(['OII', 'Hbeta', 'OIII', 'Halpha', 'SII']):
 
-        # Flatten the list of lists into a single list of booleans
-        dp_detection = [
-            item
-            for sublist in dp_lines
-            for item in sublist
-        ]
+            left_amp_region = left_amps[k]
+            right_amp_region = right_amps[k]
+            sigma_b = sigmab_region[k]
 
-        # Flatten the list of lists into a single list of fluxes
-        line_fluxes_flat = [
-            item
-            for sublist in line_fluxes
-            for item in sublist
-        ]
+            for la, ra in zip(left_amp_region, right_amp_region):
+                # Criteria 3: 1/3 < amp_r/amp_l < 3
+                # Criteria 4: amp_r, amp_l > 3 sigma_background
+                dp_detections.append((1/3 * la < ra < 3 * la)&(ra > 3 * sigma_b)&(la > 3 * sigma_b))
+
+            for j in range(len(params_2comp['left_comp'][k])):
+                left_comp_dz_free = np.concatenate([
+                    model_vel(lams[k], gaussian_parms=[params_2comp['left_comp'][k][j]])])
+                right_comp_dz_free = np.concatenate([
+                    model_vel(lams[k], gaussian_parms=[params_2comp['right_comp'][k][j]])])
+                model_lam_2comp_free = left_comp_dz_free + right_comp_dz_free
+                line_fluxes.append(np.max(model_lam_2comp_free))
+        
 
         # Convert to numpy array for boolean indexing and calculations
-        line_fluxes_flat = np.array(line_fluxes_flat)
+        line_fluxes_flat = np.array(line_fluxes)
         
         # Create an array to store ranks, initialized to -1
         line_fluxes_rank = np.full(line_fluxes_flat.shape, -1, dtype=int)
@@ -157,9 +136,10 @@ class DP:
             # The original indices of the detected fluxes are used to place the ranks.
             # The ranks are ordered according to the sorted detected fluxes.
             line_fluxes_rank[non_zero_indices[sorted_indices_of_detected]] = ranks
-        return p_value, delta_dv, dp_detection, line_fluxes_rank, params_2comp, params_1comp
+        return p_value, dp_detections, line_fluxes_rank, params_2comp, params_1comp
 
-    def get_dp_candidate(self, data_class:Spectrum, n_jobs=5):
+    
+    def fit_all(self, data_class:Spectrum, n_jobs=5):
         dp_cols = ['OII3726_dp', 'OII3729_dp',
                 'Hbeta_dp',
                 'OIII4959_dp', 'OIII5007_dp',
@@ -171,9 +151,21 @@ class DP:
             """
             Processes a single target to find double-peaked features.
             """
-            p_value, delta_dv, dp_detection, line_fluxes_rank, params_2comp, params_1comp = self.fit_dp(data_class=data_class, id=target_id)
+            p_value, dp_detections, line_fluxes_rank, params_2comp, params_1comp = self.fit_dp(data_class=data_class, id=target_id)
             idx = data_class.id2index(target_id)
             Z, RA, DEC, LOGSFR, LOGM = data_class.df.iloc[idx][['z', 'RA', 'DEC', 'LOGSFR', 'LOGM']]
+            
+            model_1comp = np.sum([
+                model_vel(data_class.data_stack[idx, 0, :], gaussian_parms=params_1comp['gaussian_params'][i]) for i in range(len(params_1comp['gaussian_params']))
+            ], axis=0)
+            
+            left_2comp = np.sum([
+                model_vel(data_class.data_stack[idx, 0, :], gaussian_parms=params_2comp['left_comp'][i]) for i in range(len(params_2comp['left_comp']))
+            ], axis=0)
+
+            right_2comp = np.sum([
+                model_vel(data_class.data_stack[idx, 0, :], gaussian_parms=params_2comp['right_comp'][i]) for i in range(len(params_2comp['right_comp']))
+            ], axis=0)
             
             data = {
                 'TARGETID': target_id.astype(np.int64),
@@ -188,15 +180,39 @@ class DP:
                 'sigma_l': params_2comp['sigma_l'].astype(np.float32),
                 'sigma_1comp': params_1comp['sigma'].astype(np.float32),
                 'p_value': p_value.astype(np.float32),
+                'model_1comp': model_1comp.astype(np.float32),
+                'left_2comp': left_2comp.astype(np.float32),
+                'right_2comp': right_2comp.astype(np.float32)
             }
-            data.update(dict(zip(dp_cols, dp_detection)))
+            data.update(dict(zip(dp_cols, dp_detections)))
             data.update(dict(zip(dp_rank_cols, line_fluxes_rank)))
             return data
-        results = Parallel(n_jobs=n_jobs)(delayed(process_target)(target_id) for target_id in tqdm(data_class.targetID))
         # Use joblib to parallelize the processing
+        results = Parallel(n_jobs=n_jobs)(delayed(process_target)(target_id) for target_id in tqdm(data_class.targetID))
+        
         dp_parent = pd.DataFrame(results)
-        dp_candidate = dp_parent[(dp_parent['p_value'] < 0.05) & (dp_parent['dv_r']-dp_parent['dv_l'] > 3*c*0.8/(Halpha_rest[0]*(1+dp_parent['Z'])))].copy()
+        
+        model_1comp = np.array(dp_parent['model_1comp'].to_list())
+        left_2comp = np.array(dp_parent['left_2comp'].to_list())
+        right_2comp = np.array(dp_parent['right_2comp'].to_list())
+        dp_parent.drop(columns=['model_1comp', 'left_2comp', 'right_2comp'], inplace=True)
+        return dp_parent, model_1comp, left_2comp, right_2comp
+        
+    
+    def select_dp_sample(self, dp_parent: pd.DataFrame, model_1comp, left_2comp, right_2comp):
+        # Criteria 1: p_value < 0.05
+        # Criteria 2: |dv_r - dv_l| > 3 * vel_resolution
+        criteria_1 = dp_parent['p_value'] < 0.05
+        criteria_2 = (dp_parent['dv_r'] - dp_parent['dv_l']).abs() > 3 * c * 0.8 / (Halpha_rest[0] * (1 + dp_parent['Z']))
+        dp_candidate = dp_parent[criteria_1 & criteria_2].copy()
 
+        dp_cols = ['OII3726_dp', 'OII3729_dp',
+                'Hbeta_dp',
+                'OIII4959_dp', 'OIII5007_dp',
+                'NII6548_dp', 'Halpha_dp', 'NII6583_dp', 
+                'SII6716_dp', 'SII6731_dp']
+        dp_rank_cols = [f'{col[:-3]}_rank' for col in dp_cols]
+        
 
         def get_dp_info(row):
             """
@@ -217,14 +233,14 @@ class DP:
                 
             # If no lines were detected, there are no DPs to count.
             if not line_info:
-                return 0, []
+                return 0
             
             # Sort by rank (the first element of the tuple)
             line_info.sort()
 
             # Check if the brightest line (first in the sorted list) has a double peak
             if not line_info[0][1]:  # line_info[0][1] is the dp_status
-                return 0, []
+                return 0
 
             # Count consecutive double peaks from the brightest and collect their names
             actual_dp_count = 0
@@ -236,65 +252,24 @@ class DP:
                 else:
                     # Stop counting when a line without a double peak is found
                     break
-                
-            return actual_dp_count, actual_dp_lines
+            return actual_dp_count
 
         # Apply the function to each row to create the new columns
-        dp_info = dp_candidate.apply(get_dp_info, axis=1)
-        dp_candidate[['dp_count', 'dp_lines']] = pd.DataFrame(dp_info.tolist(), index=dp_candidate.index)
+        dp_candidate['dp_count'] = dp_candidate.apply(get_dp_info, axis=1)
         dp_sample = dp_candidate[(dp_candidate['dp_count'] > 0)].copy()
+        model_1comp = model_1comp[dp_sample.index]
+        left_2comp = left_2comp[dp_sample.index]
+        right_2comp = right_2comp[dp_sample.index]
 
-        dp_parent.drop(columns=dp_cols+dp_rank_cols, inplace=True)
-        dp_candidate.drop(columns=dp_rank_cols, inplace=True)
-        dp_sample.drop(columns=dp_rank_cols, inplace=True)
-
-        # Update dp_cols in dp_sample to reflect only the consecutive DPs
-        for col in dp_cols:
-            line_name = col[:-3]
-            dp_candidate[col] = dp_candidate['dp_lines'].apply(lambda lines: line_name in lines)
-            dp_sample[col] = dp_sample['dp_lines'].apply(lambda lines: line_name in lines)
-
-        dp_candidate.drop(['dp_count', 'dp_lines'], axis=1, inplace=True)
-        dp_sample.drop(['dp_count', 'dp_lines'], axis=1, inplace=True)
-
-        return dp_parent, dp_candidate, dp_sample
+        return dp_sample, model_1comp, left_2comp, right_2comp
 
 
-    def reconstruct_fit(self, data_class:Spectrum, id=None):
-        idx = data_class.id2index(id)
-        lam = data_class.data_stack[idx, 0, :]
 
-
-        params_1comp, _, slice_indices, _ = FIT.fit_multi_emission_vel(data_class=data_class, id=id, two_component=False, w_dz=False)
-        model_1comp = np.sum([
-                    model_vel(lam, gaussian_parms=params_1comp['gaussian_params'][i]) 
-                    for i in range(len(slice_indices)+1)
-                ], axis=0)
-
-
-        params_2comp, _, slice_indices, _ = FIT.fit_multi_emission_vel(data_class=data_class, id=id, two_component=True, w_dz=False)
-        left_2comp = np.sum([
-            model_vel(lam, gaussian_parms=params_2comp['left_comp'][i]) for i in range(len(slice_indices)+1)
-        ], axis=0)
-
-        right_2comp = np.sum([
-            model_vel(lam, gaussian_parms=params_2comp['right_comp'][i]) for i in range(len(slice_indices)+1)
-        ], axis=0)
-        return model_1comp, left_2comp, right_2comp
-
-
-    def get_catalog(self, data_class:Spectrum, df: pd.DataFrame, fname: str, n_jobs=5):
-        
-        def process_target_reconstruct(target_id):
-            model_1comp, left_2comp, right_2comp = self.reconstruct_fit(data_class=data_class, id=target_id)
-            return model_1comp, left_2comp, right_2comp
-
-        results = Parallel(n_jobs=n_jobs)(delayed(process_target_reconstruct)(target_id) for target_id in tqdm(df['TARGETID']))
-        
+    def get_catalog(self, df: pd.DataFrame, fname: str, model_1comp, left_2comp, right_2comp):
         hdul = fits.HDUList()
         hdul.append(fits.PrimaryHDU())
         hdul.append(fits.BinTableHDU(data=df.to_records(index=False), name='DATA'))
-        hdul.append(fits.ImageHDU(data=np.array([res[0] for res in results]).astype(np.float32), name='1COMP'))
-        hdul.append(fits.ImageHDU(data=np.array([res[1] for res in results]).astype(np.float32), name='2COMP_L'))
-        hdul.append(fits.ImageHDU(data=np.array([res[2] for res in results]).astype(np.float32), name='2COMP_R'))
+        hdul.append(fits.ImageHDU(data=model_1comp.astype(np.float32), name='1COMP'))
+        hdul.append(fits.ImageHDU(data=left_2comp.astype(np.float32), name='2COMP_L'))
+        hdul.append(fits.ImageHDU(data=right_2comp.astype(np.float32), name='2COMP_R'))
         hdul.writeto(fname, overwrite=True)
