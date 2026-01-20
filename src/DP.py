@@ -6,6 +6,7 @@ import pandas as pd
 from .misc import *
 from .SPECTRUM import Spectrum
 from .FITSPECTRUM import FitSpectrum
+from astropy.table import Table
 
 FIT = FitSpectrum()
 
@@ -80,7 +81,7 @@ class DP:
         right_amps = params_2comp['right_amps']
         
         residual_region = np.split(residual_2comp, slice_indices)
-        sigmab_region = [np.std(residual_region[i]) for i in range(len(residual_region))]
+        sigmab_region = [np.std(residual_region[i]) if residual_region[i].size > 1 else 0 for i in range(len(residual_region))]
         # sigmab_region = [np.mean(combine_sigma[i]) for i in range(len(combine_sigma))]
         
         
@@ -88,7 +89,7 @@ class DP:
         right_amps = params_2comp['right_amps']
 
         residual_region = np.split(residual_2comp, slice_indices)
-        sigmab_region = [np.std(residual_region[i]) for i in range(len(residual_region))]
+        sigmab_region = [np.std(residual_region[i]) if residual_region[i].size > 1 else 0 for i in range(len(residual_region))]
 
         dp_detections = []
         line_fluxes = []
@@ -109,7 +110,10 @@ class DP:
                 right_comp_dz_free = np.concatenate([
                     model_vel(lams[k], gaussian_parms=[params_2comp['right_comp'][k][j]])])
                 model_lam_2comp_free = left_comp_dz_free + right_comp_dz_free
-                line_fluxes.append(np.max(model_lam_2comp_free))
+                try:
+                    line_fluxes.append(np.max(model_lam_2comp_free))
+                except:
+                    line_fluxes.append(0)
         
 
         # Convert to numpy array for boolean indexing and calculations
@@ -263,7 +267,46 @@ class DP:
 
         return dp_sample, model_1comp, left_2comp, right_2comp
 
+    def select_nbcs(self, dp_parent: pd.DataFrame, dp_sample: pd.DataFrame):
+        # control sample
+        cs_df = dp_parent[~dp_parent.index.isin(dp_sample.index)].copy()
 
+        # no-bias control sample
+        z_bins  = np.linspace(dp_sample['Z'].min(), dp_sample['Z'].max(), 21)
+        logm_bins = np.linspace(dp_sample['LOGM'].min(), dp_sample['LOGM'].max(), 21)
+
+        # H_dp, _ = np.histogram(dp_sample['Z'], bins=z_bins)
+        # H_cs, _ = np.histogram(cs_df['Z'], bins=z_bins)
+        H_dp, _, _ = np.histogram2d(dp_sample['Z'], dp_sample['LOGM'], bins=[z_bins, logm_bins])
+        H_cs, _, _ = np.histogram2d(cs_df['Z'], cs_df['LOGM'], bins=[z_bins, logm_bins])
+
+        H_cs_safe       = np.where(H_cs == 0, np.inf, H_cs)
+        sampling_ratio  = np.minimum(H_dp / H_cs_safe, 1.0)
+        
+        # z_bin_indices   = np.digitize(cs_df['Z'], bins=z_bins) - 1
+        z_bin_indices, logm_bin_indices = np.digitize(cs_df['Z'], bins=z_bins) - 1, np.digitize(cs_df['LOGM'], bins=logm_bins) - 1
+        z_bin_indices   = np.clip(z_bin_indices, 0, len(z_bins) - 2)
+        logm_bin_indices = np.clip(logm_bin_indices, 0, len(logm_bins) - 2)
+
+        p               = sampling_ratio[z_bin_indices, logm_bin_indices]
+
+        keep_mask       = np.random.rand(len(cs_df)) < p
+        matched_cs_indices      = cs_df.index[keep_mask]
+        unmatched_cs_indices    = cs_df.index[~keep_mask]
+        nbcs_df                 = cs_df.loc[matched_cs_indices].copy()
+        cs_nbcs_df              = cs_df.loc[unmatched_cs_indices].copy()
+        
+        
+        dp_cols = ['OII3726_dp', 'OII3729_dp',
+                'Hbeta_dp',
+                'OIII4959_dp', 'OIII5007_dp',
+                'NII6548_dp', 'Halpha_dp', 'NII6583_dp', 
+                'SII6716_dp', 'SII6731_dp']
+        dp_rank_cols = [f'{col[:-3]}_rank' for col in dp_cols]
+        cs_df.drop(columns=dp_cols+dp_rank_cols, inplace=True)
+        nbcs_df.drop(columns=dp_cols+dp_rank_cols, inplace=True)
+        cs_nbcs_df.drop(columns=dp_cols+dp_rank_cols, inplace=True)
+        return cs_df, nbcs_df, cs_nbcs_df
 
     def get_catalog(self, df: pd.DataFrame, fname: str, model_1comp, left_2comp, right_2comp):
         hdul = fits.HDUList()
@@ -273,3 +316,12 @@ class DP:
         hdul.append(fits.ImageHDU(data=left_2comp.astype(np.float32), name='2COMP_L'))
         hdul.append(fits.ImageHDU(data=right_2comp.astype(np.float32), name='2COMP_R'))
         hdul.writeto(fname, overwrite=True)
+
+    def extract_fits_data(self, fname: str):
+        fits_file = fits.open(fname)
+        df = Table(fits_file['DATA'].data).to_pandas()
+        model_1comp = fits_file['1COMP'].data
+        left_2comp = fits_file['2COMP_L'].data
+        right_2comp = fits_file['2COMP_R'].data
+        fits_file.close()
+        return df, model_1comp, left_2comp, right_2comp
