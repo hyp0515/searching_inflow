@@ -111,7 +111,7 @@ class DP:
                     model_vel(lams[k], gaussian_parms=[params_2comp['right_comp'][k][j]])])
                 model_lam_2comp_free = left_comp_dz_free + right_comp_dz_free
                 try:
-                    line_fluxes.append(np.max(model_lam_2comp_free))
+                    line_fluxes.append(np.max(model_lam_2comp_free)/sigma_b)
                 except:
                     line_fluxes.append(0)
         
@@ -237,14 +237,14 @@ class DP:
                 
             # If no lines were detected, there are no DPs to count.
             if not line_info:
-                return 0
+                return 0, []
             
             # Sort by rank (the first element of the tuple)
             line_info.sort()
 
             # Check if the brightest line (first in the sorted list) has a double peak
             if not line_info[0][1]:  # line_info[0][1] is the dp_status
-                return 0
+                return 0, []
 
             # Count consecutive double peaks from the brightest and collect their names
             actual_dp_count = 0
@@ -256,10 +256,22 @@ class DP:
                 else:
                     # Stop counting when a line without a double peak is found
                     break
-            return actual_dp_count
+            return actual_dp_count, actual_dp_lines
+        def update_dp_flags(row):
+            """
+            Updates the '_dp' flags based on the list of actual consecutive DP lines.
+            Only lines in `actual_dp_lines` will have their `_dp` flag set to True.
+            """
+            _, actual_dp_lines = get_dp_info(row)
+            for col in dp_cols:
+                line_name = col[:-3]
+                if line_name not in actual_dp_lines:
+                    row[col] = False
+            return row
 
+        # dp_candidate = dp_candidate.apply(update_dp_flags, axis=1)
         # Apply the function to each row to create the new columns
-        dp_candidate['dp_count'] = dp_candidate.apply(get_dp_info, axis=1)
+        dp_candidate['dp_count'], _ = zip(*dp_candidate.apply(get_dp_info, axis=1))
         dp_sample = dp_candidate[(dp_candidate['dp_count'] > 0)].copy()
         model_1comp = model_1comp[dp_sample.index]
         left_2comp = left_2comp[dp_sample.index]
