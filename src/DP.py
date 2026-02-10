@@ -206,9 +206,14 @@ class DP:
     def select_dp_sample(self, dp_parent: pd.DataFrame, model_1comp, left_2comp, right_2comp):
         # Criteria 1: p_value < 0.05
         # Criteria 2: |dv_r - dv_l| > 3 * vel_resolution
+        # criteria_1 = dp_parent['p_value'] < 0.05
+        # criteria_2 = (dp_parent['dv_r'] - dp_parent['dv_l']).abs() > 3 * c * 0.8 / (Halpha_rest[0] * (1 + dp_parent['Z']))
+        # dp_candidate = dp_parent[criteria_1 & criteria_2].copy()
+        
+        
         criteria_1 = dp_parent['p_value'] < 0.05
-        criteria_2 = (dp_parent['dv_r'] - dp_parent['dv_l']).abs() > 3 * c * 0.8 / (Halpha_rest[0] * (1 + dp_parent['Z']))
-        dp_candidate = dp_parent[criteria_1 & criteria_2].copy()
+        # criteria_2 = (dp_parent['dv_r'] - dp_parent['dv_l']).abs() > 3 * c * 0.8 / (Halpha_rest[0] * (1 + dp_parent['Z']))
+        dp_candidate = dp_parent[criteria_1].copy()
 
         dp_cols = ['OII3726_dp', 'OII3729_dp',
                 'Hbeta_dp',
@@ -320,13 +325,16 @@ class DP:
         cs_nbcs_df.drop(columns=dp_cols+dp_rank_cols, inplace=True)
         return cs_df, nbcs_df, cs_nbcs_df
 
-    def get_catalog(self, df: pd.DataFrame, fname: str, model_1comp, left_2comp, right_2comp):
+    def get_catalog(self, df: pd.DataFrame, fname: str, model_1comp=None, left_2comp=None, right_2comp=None):
         hdul = fits.HDUList()
         hdul.append(fits.PrimaryHDU())
         hdul.append(fits.BinTableHDU(data=df.to_records(index=False), name='DATA'))
-        hdul.append(fits.ImageHDU(data=model_1comp.astype(np.float32), name='1COMP'))
-        hdul.append(fits.ImageHDU(data=left_2comp.astype(np.float32), name='2COMP_L'))
-        hdul.append(fits.ImageHDU(data=right_2comp.astype(np.float32), name='2COMP_R'))
+        if model_1comp is not None:
+            hdul.append(fits.ImageHDU(data=model_1comp.astype(np.float32), name='1COMP'))
+        if left_2comp is not None:
+            hdul.append(fits.ImageHDU(data=left_2comp.astype(np.float32), name='2COMP_L'))
+        if right_2comp is not None:
+            hdul.append(fits.ImageHDU(data=right_2comp.astype(np.float32), name='2COMP_R'))
         hdul.writeto(fname, overwrite=True)
 
     def extract_fits_data(self, fname: str):
