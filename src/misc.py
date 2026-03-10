@@ -144,9 +144,8 @@ def model_vel(lam, gaussian_parms=None, conti_parms=(0, 0)):
 
     return flux + conti
 
-def image_link(RA, DEC, save_image=False, fname=None, plot=False):
+def image_link(RA, DEC, save_image=False, fname=None, plot=False, side_arcmin=0.5):
     if save_image:
-        side_arcmin = 0.5
         scale = np.round(side_arcmin / 3, 6)
         url = f'https://www.legacysurvey.org/viewer/cutout.jpg?ra={RA}&dec={DEC}&pixscale={scale}&layer=hsc-dr3&size=200'
         with requests.get(url, stream=True, timeout=(10, 30)) as r:

@@ -12,3 +12,4 @@ images/*.jpg
 *.csv
 *.fits
 */*.fits
+.vscode/
