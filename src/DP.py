@@ -147,7 +147,7 @@ class DP:
         dp_cols = ['OII3726_dp', 'OII3729_dp',
                 'Hbeta_dp',
                 'OIII4959_dp', 'OIII5007_dp',
-                'NII6548_dp', 'Halpha_dp', 'NII6583_dp', 
+                'NII6548_dp', 'NII6583_dp', 'Halpha_dp', 
                 'SII6716_dp', 'SII6731_dp']
         dp_rank_cols = [f'{col[:-3]}_rank' for col in dp_cols]
         
@@ -218,7 +218,7 @@ class DP:
         dp_cols = ['OII3726_dp', 'OII3729_dp',
                 'Hbeta_dp',
                 'OIII4959_dp', 'OIII5007_dp',
-                'NII6548_dp', 'Halpha_dp', 'NII6583_dp', 
+                'NII6548_dp', 'NII6583_dp', 'Halpha_dp', 
                 'SII6716_dp', 'SII6731_dp']
         dp_rank_cols = [f'{col[:-3]}_rank' for col in dp_cols]
         
@@ -317,13 +317,83 @@ class DP:
         dp_cols = ['OII3726_dp', 'OII3729_dp',
                 'Hbeta_dp',
                 'OIII4959_dp', 'OIII5007_dp',
-                'NII6548_dp', 'Halpha_dp', 'NII6583_dp', 
+                'NII6548_dp', 'NII6583_dp', 'Halpha_dp', 
                 'SII6716_dp', 'SII6731_dp']
         dp_rank_cols = [f'{col[:-3]}_rank' for col in dp_cols]
         cs_df.drop(columns=dp_cols+dp_rank_cols, inplace=True)
         nbcs_df.drop(columns=dp_cols+dp_rank_cols, inplace=True)
         cs_nbcs_df.drop(columns=dp_cols+dp_rank_cols, inplace=True)
         return cs_df, nbcs_df, cs_nbcs_df
+
+    def bpt_classification(self, df: pd.DataFrame, sigmas=None, model_1comp=None, left_2comp=None, right_2comp=None, two_comp=True):
+        classification_map = {
+            1: 'SF', 4: 'COMP', 16: 'AGN', 64: 'LINER', 256: 'unclassified',
+            2: 'double SF', 8: 'double COMP', 32: 'double AGN', 128: 'double LINER',
+            5: 'SF+COMP', 17: 'SF+AGN', 65: 'SF+LINER',
+            20: 'COMP+AGN', 68: 'COMP+LINER', 80: 'AGN+LINER',
+            257: 'SF+uncertain', 260: 'COMP+uncertain', 272: 'AGN+uncertain', 320: 'LINER+uncertain',
+            512: 'unclassified'
+        }
+        
+        def bpt(lam, flux, sigma, offset):
+            unavailable_lines = []
+            line_fluxes = []
+            for i, lam0 in enumerate([Hbeta_rest[0], OIII_rest[1], Halpha_rest[0], NII_rest[1]]):
+                line_flux = np.max(flux[(lam>lam0*(1+offset)-0.8) & (lam<lam0*(1+offset)+0.8)])
+                line_noise = np.median(sigma[(lam>lam0*(1+offset)-0.8) & (lam<lam0*(1+offset)+0.8)])
+                if line_flux < 3*line_noise:
+                    unavailable_lines.append(i)
+                    line_fluxes.append(line_noise)
+                else:
+                    line_fluxes.append(line_flux)
+                if len(unavailable_lines) > 1:
+                    return 256, []
+
+            oiii_hbeta = np.log10(line_fluxes[1]/line_fluxes[0])
+            nii_halpha = np.log10(line_fluxes[3]/line_fluxes[2])
+
+            sf_boundary = 0.61/(nii_halpha-0.05)+1.30
+            comp_boundary = 0.61/(nii_halpha-0.47)+1.19
+            liner_boundary = 1.05*nii_halpha + 0.45
+            if (sf_boundary > oiii_hbeta or comp_boundary > oiii_hbeta) and (nii_halpha < 0.47):
+                if (sf_boundary > oiii_hbeta) and (nii_halpha < 0.05):
+                    return 1, line_fluxes
+                else:
+                    return 4, line_fluxes
+            elif (sf_boundary < oiii_hbeta or comp_boundary < oiii_hbeta):
+                if liner_boundary > oiii_hbeta:
+                    return 64, line_fluxes
+                else:
+                    return 16, line_fluxes
+            else:
+                return 256, line_fluxes
+
+
+        df['BPT_1comp'] = [0] * len(df)
+        df['BPT_2comp'] = [0] * len(df)
+
+        bpt_1comp = []
+        bpt_2comp = []
+        for i in range(len(df)):
+            lam = desi_wavelength/(1 + df['Z'][i])
+            bpt_class_val, _ = bpt(lam, model_1comp[i], sigmas[i, :], 0)
+            bpt_1comp.append(bpt_class_val)
+        
+            if two_comp is True:
+                bpt_class_val = 0
+                models = [left_2comp[i], right_2comp[i]]
+                offsets = [df.iloc[i]['dv_l']/c, df.iloc[i]['dv_r']/c]
+                for j, (model, offset) in enumerate(zip(models, offsets)):
+                    classification, line_fluxes = bpt(lam, model, sigmas[i, :], offset)
+                    bpt_class_val += classification
+                bpt_2comp.append(bpt_class_val)
+            
+        df['BPT_1comp'] = bpt_1comp
+        if two_comp is True:
+            df['BPT_2comp'] = bpt_2comp
+        return df
+
+
 
     def get_catalog(self, df: pd.DataFrame, fname: str, model_1comp=None, left_2comp=None, right_2comp=None):
         hdul = fits.HDUList()
