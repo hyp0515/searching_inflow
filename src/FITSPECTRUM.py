@@ -98,6 +98,8 @@ class FitSpectrum:
         data_class.subset(filter_mask)
         return data_class
 
+    
+    
 
     def fit_multi_emission_vel(self, data_class:Spectrum, 
                                id=None, two_component=False, w_dz=False):
@@ -188,7 +190,7 @@ class FitSpectrum:
         combine_conti   = np.concatenate(contis)
 
         def unpack_params(params):
-            gaussian_parms = [[] for _ in range(len(crop_region))] # OII, OIII, Halpha, SII
+            gaussian_parms = [[] for _ in range(len(crop_region))] # OII, Hbeta, OIII, Halpha, SII
             lam0_adj = 1.0
             if two_component:
                 if w_dz:

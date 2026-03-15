@@ -172,20 +172,20 @@ class DP:
             ], axis=0)
             
             data = {
-                'TARGETID': target_id.astype(np.int64),
-                'RA': RA.astype(np.float32),
-                'DEC': DEC.astype(np.float32),
-                'Z': Z.astype(np.float32),
-                'LOGM': LOGM.astype(np.float32),
-                'LOGSFR': LOGSFR.astype(np.float32),
-                'dv_r': params_2comp['dv_r'].astype(np.float32),
-                'dv_l': params_2comp['dv_l'].astype(np.float32),
-                'sigma_r': params_2comp['sigma_r'].astype(np.float32),
-                'sigma_l': params_2comp['sigma_l'].astype(np.float32),
+                   'TARGETID': target_id.astype(np.int64),
+                         'RA': RA.astype(np.float32),
+                        'DEC': DEC.astype(np.float32),
+                          'Z': Z.astype(np.float32),
+                       'LOGM': LOGM.astype(np.float32),
+                     'LOGSFR': LOGSFR.astype(np.float32),
+                       'dv_r': params_2comp['dv_r'].astype(np.float32),
+                       'dv_l': params_2comp['dv_l'].astype(np.float32),
+                    'sigma_r': params_2comp['sigma_r'].astype(np.float32),
+                    'sigma_l': params_2comp['sigma_l'].astype(np.float32),
                 'sigma_1comp': params_1comp['sigma'].astype(np.float32),
-                'p_value': p_value.astype(np.float32),
+                    'p_value': p_value.astype(np.float32),
                 'model_1comp': model_1comp.astype(np.float32),
-                'left_2comp': left_2comp.astype(np.float32),
+                 'left_2comp': left_2comp.astype(np.float32),
                 'right_2comp': right_2comp.astype(np.float32)
             }
             data.update(dict(zip(dp_cols, dp_detections)))
@@ -197,7 +197,7 @@ class DP:
         dp_parent = pd.DataFrame(results)
         
         model_1comp = np.array(dp_parent['model_1comp'].to_list())
-        left_2comp = np.array(dp_parent['left_2comp'].to_list())
+        left_2comp  = np.array(dp_parent['left_2comp'].to_list())
         right_2comp = np.array(dp_parent['right_2comp'].to_list())
         dp_parent.drop(columns=['model_1comp', 'left_2comp', 'right_2comp'], inplace=True)
         return dp_parent, model_1comp, left_2comp, right_2comp
