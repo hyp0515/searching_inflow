@@ -2,63 +2,58 @@ import numpy as np
 import pandas as pd
 from astropy.table import Table
 from .misc import *
-
+import tqdm
+import time
 
 class Spectrum:
 
-    def __init__(self, spectra_data, cigale_data, fastspecfit_data, load_targetID=None):
-
+    def __init__(self, 
+                 spectra_data, 
+                 cigale_data, 
+                 fastspecfit_data, 
+                 load_targetID=None,
+                 subtype_filter=None):
+        start_time = time.time()
         cigale_extract_columns = ['TARGETID', 'SPECTYPE', 'LOGM', 'LOGSFR', 
                                   'FLUX_G', 'FLUX_R', 'FLUX_W1', 'FLUX_W2', 'FLUX_Z']
         fastspecfit_extract_columns = ['TARGETID']
 
         # Convert the data from each FITS file into a pandas DataFrame
-        df_spectra = Table(spectra_data[1].data).to_pandas()
-        df_cigale = Table(cigale_data[1].data).to_pandas()
-        df_fastspecfit = Table(fastspecfit_data[1].data).to_pandas()
+        df_spectra      = Table(spectra_data[1].data).to_pandas()
+        df_cigale       = Table(cigale_data[1].data).to_pandas()
+        df_fastspecfit  = Table(fastspecfit_data[1].data).to_pandas()
 
-        # Merge the DataFrames on the 'TARGETID' column
-        # Start with the first DataFrame
         merged_df = df_spectra
-        
-        # Sequentially merge the other DataFrames
-        # Using an inner join to keep only the target IDs present in all files
         merged_df = pd.merge(merged_df, df_cigale[cigale_extract_columns], on='TARGETID', how='inner')
         merged_df = pd.merge(merged_df, df_fastspecfit[fastspecfit_extract_columns], on='TARGETID', how='inner')
-
-        # Sort by TARGETID to ensure consistent order with array data
         merged_df = merged_df.sort_values('TARGETID').reset_index(drop=True)
 
         if load_targetID is not None:
             merged_df = merged_df[merged_df['TARGETID'].isin(load_targetID)].reset_index(drop=True)
-        
-        # Store the metadata in the dataframe
+
+        if subtype_filter is not None:
+            merged_df = merged_df[merged_df['SPECTYPE'] != subtype_filter].reset_index(drop=True)
+
         self.df = merged_df
         self.targetID = self.df['TARGETID'].to_numpy()
         self.n_spectra = len(self.targetID)
-
-        # Get the sorting indices to match the dataframe's order
-        # This is necessary because the dataframe is sorted by TARGETID
-        # Create a mapping from the original TARGETID to its index for spectra and fastspecfit data
+        self.df['Z'] = self.df['Z'].to_numpy()
+        
         spectra_id_map = {tid: i for i, tid in enumerate(spectra_data[1].data['TARGETID'])}
         fastspecfit_id_map = {tid: i for i, tid in enumerate(fastspecfit_data[1].data['TARGETID'])}
-
-        # Get the desired order of indices based on the sorted TARGETIDs in the merged dataframe
         spectra_indices = [spectra_id_map[tid] for tid in self.df['TARGETID']]
         fastspecfit_indices = [fastspecfit_id_map[tid] for tid in self.df['TARGETID']]
 
         # Use advanced integer indexing to select and reorder the data in a single step
         self.coadd_data = np.asarray(spectra_data[2].data[spectra_indices, 0, :], dtype=np.float32)
         self.ivar       = np.asarray(spectra_data[3].data[spectra_indices, 0, :], dtype=np.float32)
-        self.mask       = np.asarray(spectra_data[4].data[spectra_indices, 0, :], dtype=np.float32)
+        mask            = np.asarray(spectra_data[4].data[spectra_indices, 0, :], dtype=np.float32)
+        self.mask       = mask.astype(int) | np.where(self.ivar <= 0, 1, 0)
         self.continuum  = np.asarray(fastspecfit_data[2].data[fastspecfit_indices], dtype=np.float32)
-        self.emission   = np.asarray(fastspecfit_data[4].data[fastspecfit_indices], dtype=np.float32)
+        self.flux = self.coadd_data - self.continuum
+        # self.emission   = np.asarray(fastspecfit_data[4].data[fastspecfit_indices], dtype=np.float32)
 
-        # Add columns to the dataframe that were previously separate attributes
-        self.df['z_pipe'] = self.df['Z']
-        self.df['z'] = self.df['z_pipe'].copy()
-        self.df.drop(columns=['Z'], inplace=True)
-
+        
         # Calculate and store color magnitudes
         color_flux = self.df[['FLUX_G', 'FLUX_R', 'FLUX_Z', 'FLUX_W1', 'FLUX_W2']].to_numpy()
         with np.errstate(divide='ignore', invalid='ignore'):
@@ -68,6 +63,8 @@ class Spectrum:
         self.color_mag = color_mag_all
         
         self._id_to_idx = {int(tid): i for i, tid in enumerate(self.targetID)}
+        end_time = time.time()
+        print(f"Data loading and processing took {end_time - start_time:.2f} seconds.")
     
     def add_attribute(self, name, value):
         setattr(self, name, value)
@@ -80,15 +77,13 @@ class Spectrum:
         # idx may be a boolean mask or integer array
         self.targetID   = self.targetID[idx]
         self.n_spectra  = len(self.targetID)
-
         self.df        = self.df.iloc[idx].reset_index(drop=True)
-        
         self.coadd_data = self.coadd_data[idx]
         self.ivar       = self.ivar[idx]
         self.mask       = self.mask[idx]
         self.continuum  = self.continuum[idx]
-        self.emission   = self.emission[idx]
-        if hasattr(self, 'data_stack'):     self.data_stack = self.data_stack[idx, :, :]
+        # self.emission    = self.emission[idx]
+    
         if hasattr(self, "color_mag"):      self.color_mag = self.color_mag[idx]
         if hasattr(self, "smoothed_flux"):  self.smoothed_flux = self.smoothed_flux[idx]
 
@@ -131,19 +126,7 @@ class Spectrum:
                 # If any ID is not found, raise an error
                 raise ValueError(f"targetID {e.args[0]} not found in the dataset.") from e
 
-    def SFG_filter(self, exclude=False):
-        logM = self.df['LOGM'].to_numpy()
-        logSFR = self.df['LOGSFR'].to_numpy()
-        criteria = logSFR > (1 * (logM - 10) - 3)
-
-        if exclude:
-            criteria = ~criteria
-            
-        self.subset(criteria)
-        return self
-
     def subtype_filter(self, subtype='QSO', exclude=True):
-        
         if subtype.upper() not in ['QSO', 'LRG', 'ELG', 'BGS', 'MWS']:
             print(f"Subtype '{subtype}' not recognized. Available subtypes: ['QSO', 'LRG', 'ELG', 'BGS', 'MWS']")
             return np.array([False] * self.n_spectra)
@@ -158,49 +141,8 @@ class Spectrum:
         return self
 
     def z_filter(self, max_z=0.4):
-        z = self.df['z'].to_numpy()
+        z = self.df['Z']
         criteria = z < max_z
         self.subset(criteria)
         return self
 
-    #
-    # Stack data and mask bad pixels for convenience
-    #    
-    def stack_data(self):
-        n_spectra   = self.n_spectra
-        coadd_data  = self.coadd_data
-        ivar        = self.ivar
-        mask        = self.mask
-        mask        = mask.astype(int) | np.where(ivar <= 0, 1, 0)
-        continuum   = self.continuum
-        emission    = self.emission
-
-        lam = np.tile(desi_wavelength, (n_spectra, 1))
-        data_stack = np.column_stack((lam, coadd_data-continuum, ivar, mask, continuum, emission))
-        data_stack = data_stack.reshape(n_spectra, 6, -1)
-        self.add_attribute('data_stack', data_stack)
-        return self
-    #
-    # Shift to rest frame
-    #
-    def shift_to_rest_frame(self, i=None, id=None, dz=None):
-
-        data_stack = self.data_stack
-        id2index = self.id2index
-        z = self.df['z'].to_numpy()
-
-        
-        if (i is None) or (id is None):
-            data_stack[:, 0, :] = desi_wavelength.copy() / (1 + z[:, np.newaxis])
-        else:
-            if id is not None:
-                i = id2index(id)
-            
-            if dz is None:
-                data_stack[i, 0, :] = desi_wavelength.copy() / (1 + z[i])
-            else:
-                data_stack[i, 0, :] = desi_wavelength.copy() / (1 + z[i] + dz)
-                self.df.at[i, 'z'] = z[i] + dz
-
-        self.data_stack = data_stack
-        return self

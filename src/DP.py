@@ -24,7 +24,7 @@ class DP:
 
     def reconstruct_fit(self, data_class:Spectrum, id=None):
         idx = data_class.id2index(id)
-        lam = data_class.data_stack[idx, 0, :]
+        lam = desi_wavelength / (1 + data_class.df.iloc[idx]['Z'])
 
 
         params_1comp, _, slice_indices, _ = FIT.fit_multi_emission_vel(data_class=data_class, id=id, two_component=False, w_dz=False)
@@ -61,6 +61,9 @@ class DP:
         residual_2comp = combine_flux - model_2comp
 
         # Criteria 1: F-test
+        """
+        The calculation chi-square here doesn't include the spectrum outside the fitted region.
+        """
         chisq_1comp = np.sum((residual_1comp/combine_sigma)**2)
         dof_1comp = len(combine_lam) - (1+n_lines_fit)
         
@@ -71,104 +74,120 @@ class DP:
         p_value = 1 - f.cdf(F_stat, dof_1comp - dof_2comp, dof_2comp)
 
 
-    
         # Criteria 2: |dv_r-dv_l| > 3 vel_resolution
         dv_r, dv_l = params_2comp['dv_r'], params_2comp['dv_l']
         delta_dv = np.abs(dv_r - dv_l)
         
 
-        left_amps  = params_2comp['left_amps']
-        right_amps = params_2comp['right_amps']
-        
         residual_region = np.split(residual_2comp, slice_indices)
         sigmab_region = [np.std(residual_region[i]) if residual_region[i].size > 1 else 0 for i in range(len(residual_region))]
-        # sigmab_region = [np.mean(combine_sigma[i]) for i in range(len(combine_sigma))]
-        
-        
-        left_amps  = params_2comp['left_amps']
-        right_amps = params_2comp['right_amps']
+        # noise_region = np.split(combine_sigma, slice_indices)
+        # sigmab_region = [np.sqrt(np.mean(noise_region[i]**2)) if noise_region[i].size > 1 else 0 for i in range(len(noise_region))]
 
-        residual_region = np.split(residual_2comp, slice_indices)
-        sigmab_region = [np.std(residual_region[i]) if residual_region[i].size > 1 else 0 for i in range(len(residual_region))]
 
+        
         dp_detections = []
-        line_fluxes = []
-        for k, _ in enumerate(['OII', 'Hbeta', 'OIII', 'Halpha', 'SII']):
+        line_snr = []
+        
+        lams_1comp = []
+        flux_1comp = []
 
-            left_amp_region = left_amps[k]
-            right_amp_region = right_amps[k]
-            sigma_b = sigmab_region[k]
+        lams_2compL = []
+        flux_2compL = []
 
-            for la, ra in zip(left_amp_region, right_amp_region):
+        lams_2compR = []
+        flux_2compR = []
+        
+        for i, amp in enumerate(params_1comp['amps']):
+            for j in range(len(amp)):
+                
+                lams_1comp.append(params_1comp['lam0s'][i][j])
+                flux_1comp.append(params_1comp['amps'][i][j]*np.sqrt(2*np.pi)*params_1comp['sigma']*params_1comp['lam0s'][i][j]/c)
+
+
                 # Criteria 3: 1/3 < amp_r/amp_l < 3
                 # Criteria 4: amp_r, amp_l > 3 sigma_background
-                dp_detections.append((1/3 * la < ra < 3 * la)&(ra > 3 * sigma_b)&(la > 3 * sigma_b))
+                amp_l, amp_r = params_2comp['left_amps'][i][j], params_2comp['right_amps'][i][j]
+                dp_detections.append((1/3 * amp_l < amp_r < 3 * amp_l)&(amp_r > 3 * sigmab_region[i])&(amp_l > 3 * sigmab_region[i]))
 
-            for j in range(len(params_2comp['left_comp'][k])):
-                left_comp_dz_free = np.concatenate([
-                    model_vel(lams[k], gaussian_parms=[params_2comp['left_comp'][k][j]])])
-                right_comp_dz_free = np.concatenate([
-                    model_vel(lams[k], gaussian_parms=[params_2comp['right_comp'][k][j]])])
-                model_lam_2comp_free = left_comp_dz_free + right_comp_dz_free
+                lams_2compL.append(params_2comp['left_lam0s'][i][j])
+                flux_2compL.append(amp_l*np.sqrt(2*np.pi)*params_2comp['sigma_l']*params_2comp['left_lam0s'][i][j]*(1+params_2comp['dv_l']/c)/c)
+
+                lams_2compR.append(params_2comp['right_lam0s'][i][j])
+                flux_2compR.append(amp_r*np.sqrt(2*np.pi)*params_2comp['sigma_r']*params_2comp['right_lam0s'][i][j]*(1+params_2comp['dv_r']/c)/c)
+
+                model_2comp_l = model_vel(lams[i], gaussian_parms=[(amp_l, 
+                                                                    params_2comp['left_lam0s'][i][j], 
+                                                                    params_2comp['dv_l'], 
+                                                                    params_2comp['sigma_l'])])
+                model_2comp_r = model_vel(lams[i], gaussian_parms=[(amp_r, 
+                                                                    params_2comp['right_lam0s'][i][j], 
+                                                                    params_2comp['dv_r'], 
+                                                                    params_2comp['sigma_r'])])
+                model_2comp = model_2comp_l + model_2comp_r
                 try:
-                    line_fluxes.append(np.max(model_lam_2comp_free)/sigma_b)
+                    line_snr.append(np.max(model_2comp)/sigmab_region[i])
                 except:
-                    line_fluxes.append(0)
-        
+                    line_snr.append(0)
 
-        # Convert to numpy array for boolean indexing and calculations
-        line_fluxes_flat = np.array(line_fluxes)
-        
-        # Create an array to store ranks, initialized to -1
-        line_fluxes_rank = np.full(line_fluxes_flat.shape, -1, dtype=int)
-        
-        # Get the indices of non-zero fluxes
-        non_zero_indices = np.where(line_fluxes_flat > 0)[0]
-        
-        # If there are non-zero fluxes, rank them
+        line_snr_flat = np.array(line_snr)
+        line_snr_rank = np.full(line_snr_flat.shape, -1, dtype=int)
+        non_zero_indices = np.where(line_snr_flat > 0)[0]
+
         if non_zero_indices.size > 0:
-            # Get the fluxes that are not zero
-            detected_fluxes = line_fluxes_flat[non_zero_indices]
-            
-            # Get the indices that would sort the detected fluxes in descending order
-            sorted_indices_of_detected = np.argsort(detected_fluxes)[::-1]
-            
-            # Create the ranks (0 for the highest flux, 1 for the second, etc.)
-            ranks = np.arange(len(detected_fluxes))
-            
-            # Place the ranks back into the correct positions in the full rank array
-            # The original indices of the detected fluxes are used to place the ranks.
-            # The ranks are ordered according to the sorted detected fluxes.
-            line_fluxes_rank[non_zero_indices[sorted_indices_of_detected]] = ranks
-        return p_value, dp_detections, line_fluxes_rank, params_2comp, params_1comp
+            detected_snr = line_snr_flat[non_zero_indices]
+            sorted_indices_of_detected = np.argsort(detected_snr)[::-1]
+            ranks = np.arange(len(detected_snr))
+            line_snr_rank[non_zero_indices[sorted_indices_of_detected]] = ranks
+        
+        line_cols = ['OII3729', 'OII3726',
+                    'Hbeta',
+                    'OIII5007', 'OIII4959',
+                    'Halpha', 'NII6583', 'NII6548',
+                    'SII6731', 'SII6716']
+        df_1comp = pd.DataFrame({'line': line_cols, 
+                                 'lam0': lams_1comp, 
+                                 'flux_1comp': flux_1comp})
+        df_2comp = pd.DataFrame({'lam0': lams_2compL, 
+                                 'flux_2compL': flux_2compL, 
+                                 'flux_2compR': flux_2compR,
+                                 'dp': dp_detections,
+                                 'dp_rank': line_snr_rank})
+        df_line = pd.merge(df_1comp, df_2comp, on='lam0', how='outer').sort_values(by='lam0').reset_index(drop=True)
+        
+        return p_value, df_line, params_2comp, params_1comp
 
     
     def fit_all(self, data_class:Spectrum, n_jobs=5):
-        dp_cols = ['OII3726_dp', 'OII3729_dp',
-                'Hbeta_dp',
-                'OIII4959_dp', 'OIII5007_dp',
-                'NII6548_dp', 'NII6583_dp', 'Halpha_dp', 
-                'SII6716_dp', 'SII6731_dp']
-        dp_rank_cols = [f'{col[:-3]}_rank' for col in dp_cols]
-        
+        line_cols = ['OII3726', 'OII3729',
+                    'Hbeta',
+                    'OIII4959', 'OIII5007',
+                    'NII6548', 'Halpha', 'NII6583', 
+                    'SII6716', 'SII6731']
+        dp_cols = [f'{col}_dp' for col in line_cols]
+        dp_rank_cols = [f'{col}_rank' for col in line_cols]
+        flux_1comp_cols = [f'{col}_1comp' for col in line_cols]
+        flux_2compL_cols = [f'{col}_2compL' for col in line_cols]
+        flux_2compR_cols = [f'{col}_2compR' for col in line_cols]
+
         def process_target(target_id):
             """
             Processes a single target to find double-peaked features.
             """
-            p_value, dp_detections, line_fluxes_rank, params_2comp, params_1comp = self.fit_dp(data_class=data_class, id=target_id)
+            p_value, df_line, params_2comp, params_1comp = self.fit_dp(data_class=data_class, id=target_id)
             idx = data_class.id2index(target_id)
             Z, RA, DEC, LOGSFR, LOGM = data_class.df.iloc[idx][['z', 'RA', 'DEC', 'LOGSFR', 'LOGM']]
-            
+            lam = desi_wavelength / (1 + Z)
             model_1comp = np.sum([
-                model_vel(data_class.data_stack[idx, 0, :], gaussian_parms=params_1comp['gaussian_params'][i]) for i in range(len(params_1comp['gaussian_params']))
+                model_vel(lam, gaussian_parms=params_1comp['gaussian_params'][i]) for i in range(len(params_1comp['gaussian_params']))
             ], axis=0)
             
             left_2comp = np.sum([
-                model_vel(data_class.data_stack[idx, 0, :], gaussian_parms=params_2comp['left_comp'][i]) for i in range(len(params_2comp['left_comp']))
+                model_vel(lam, gaussian_parms=params_2comp['left_comp'][i]) for i in range(len(params_2comp['left_comp']))
             ], axis=0)
 
             right_2comp = np.sum([
-                model_vel(data_class.data_stack[idx, 0, :], gaussian_parms=params_2comp['right_comp'][i]) for i in range(len(params_2comp['right_comp']))
+                model_vel(lam, gaussian_parms=params_2comp['right_comp'][i]) for i in range(len(params_2comp['right_comp']))
             ], axis=0)
             
             data = {
@@ -188,8 +207,11 @@ class DP:
                  'left_2comp': left_2comp.astype(np.float32),
                 'right_2comp': right_2comp.astype(np.float32)
             }
-            data.update(dict(zip(dp_cols, dp_detections)))
-            data.update(dict(zip(dp_rank_cols, line_fluxes_rank)))
+            data.update(dict(zip(flux_1comp_cols, df_line['flux_1comp'].to_numpy().astype(np.float32))))
+            data.update(dict(zip(flux_2compL_cols, df_line['flux_2compL'].to_numpy().astype(np.float32))))
+            data.update(dict(zip(flux_2compR_cols, df_line['flux_2compR'].to_numpy().astype(np.float32))))
+            data.update(dict(zip(dp_cols, df_line['dp'])))
+            data.update(dict(zip(dp_rank_cols, df_line['dp_rank'])))
             return data
         # Use joblib to parallelize the processing
         results = Parallel(n_jobs=n_jobs)(delayed(process_target)(target_id) for target_id in tqdm(data_class.targetID))
@@ -262,19 +284,7 @@ class DP:
                     # Stop counting when a line without a double peak is found
                     break
             return actual_dp_count, actual_dp_lines
-        def update_dp_flags(row):
-            """
-            Updates the '_dp' flags based on the list of actual consecutive DP lines.
-            Only lines in `actual_dp_lines` will have their `_dp` flag set to True.
-            """
-            _, actual_dp_lines = get_dp_info(row)
-            for col in dp_cols:
-                line_name = col[:-3]
-                if line_name not in actual_dp_lines:
-                    row[col] = False
-            return row
 
-        # dp_candidate = dp_candidate.apply(update_dp_flags, axis=1)
         # Apply the function to each row to create the new columns
         dp_candidate['dp_count'], _ = zip(*dp_candidate.apply(get_dp_info, axis=1))
         dp_sample = dp_candidate[(dp_candidate['dp_count'] > 0)].copy()
@@ -292,15 +302,12 @@ class DP:
         z_bins  = np.linspace(dp_sample['Z'].min(), dp_sample['Z'].max(), 21)
         logm_bins = np.linspace(dp_sample['LOGM'].min(), dp_sample['LOGM'].max(), 21)
 
-        # H_dp, _ = np.histogram(dp_sample['Z'], bins=z_bins)
-        # H_cs, _ = np.histogram(cs_df['Z'], bins=z_bins)
         H_dp, _, _ = np.histogram2d(dp_sample['Z'], dp_sample['LOGM'], bins=[z_bins, logm_bins])
         H_cs, _, _ = np.histogram2d(cs_df['Z'], cs_df['LOGM'], bins=[z_bins, logm_bins])
 
         H_cs_safe       = np.where(H_cs == 0, np.inf, H_cs)
         sampling_ratio  = np.minimum(H_dp / H_cs_safe, 1.0)
         
-        # z_bin_indices   = np.digitize(cs_df['Z'], bins=z_bins) - 1
         z_bin_indices, logm_bin_indices = np.digitize(cs_df['Z'], bins=z_bins) - 1, np.digitize(cs_df['LOGM'], bins=logm_bins) - 1
         z_bin_indices   = np.clip(z_bin_indices, 0, len(z_bins) - 2)
         logm_bin_indices = np.clip(logm_bin_indices, 0, len(logm_bins) - 2)
@@ -313,16 +320,6 @@ class DP:
         nbcs_df                 = cs_df.loc[matched_cs_indices].copy()
         cs_nbcs_df              = cs_df.loc[unmatched_cs_indices].copy()
         
-        
-        dp_cols = ['OII3726_dp', 'OII3729_dp',
-                'Hbeta_dp',
-                'OIII4959_dp', 'OIII5007_dp',
-                'NII6548_dp', 'NII6583_dp', 'Halpha_dp', 
-                'SII6716_dp', 'SII6731_dp']
-        dp_rank_cols = [f'{col[:-3]}_rank' for col in dp_cols]
-        cs_df.drop(columns=dp_cols+dp_rank_cols, inplace=True)
-        nbcs_df.drop(columns=dp_cols+dp_rank_cols, inplace=True)
-        cs_nbcs_df.drop(columns=dp_cols+dp_rank_cols, inplace=True)
         return cs_df, nbcs_df, cs_nbcs_df
 
     def bpt_classification(self, df: pd.DataFrame, sigmas=None, model_1comp=None, left_2comp=None, right_2comp=None, two_comp=True):
@@ -335,17 +332,26 @@ class DP:
             512: 'unclassified'
         }
         
+        line_cols = ['OII3726', 'OII3729',
+                    'Hbeta',
+                    'OIII4959', 'OIII5007',
+                    'NII6548', 'Halpha', 'NII6583', 
+                    'SII6716', 'SII6731']
+        flux_1comp_cols = [f'{col}_1comp' for col in line_cols]
+        flux_2compL_cols = [f'{col}_2compL' for col in line_cols]
+        flux_2compR_cols = [f'{col}_2compR' for col in line_cols]
+        
         def bpt(lam, flux, sigma, offset):
             unavailable_lines = []
             line_fluxes = []
             for i, lam0 in enumerate([Hbeta_rest[0], OIII_rest[1], Halpha_rest[0], NII_rest[1]]):
-                line_flux = np.max(flux[(lam>lam0*(1+offset)-0.8) & (lam<lam0*(1+offset)+0.8)])
+                line_flux_peak = np.max(flux[(lam>lam0*(1+offset)-0.8) & (lam<lam0*(1+offset)+0.8)])
                 line_noise = np.median(sigma[(lam>lam0*(1+offset)-0.8) & (lam<lam0*(1+offset)+0.8)])
-                if line_flux < 3*line_noise:
+                if line_flux_peak < 3*line_noise:
                     unavailable_lines.append(i)
                     line_fluxes.append(line_noise)
                 else:
-                    line_fluxes.append(line_flux)
+                    line_fluxes.append(line_flux_peak)
                 if len(unavailable_lines) > 1:
                     return 256, []
 
