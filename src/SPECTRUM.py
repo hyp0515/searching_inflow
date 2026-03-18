@@ -50,8 +50,8 @@ class Spectrum:
         mask            = np.asarray(spectra_data[4].data[spectra_indices, 0, :], dtype=np.float32)
         self.mask       = mask.astype(int) | np.where(self.ivar <= 0, 1, 0)
         self.continuum  = np.asarray(fastspecfit_data[2].data[fastspecfit_indices], dtype=np.float32)
-        self.flux = self.coadd_data - self.continuum
-        # self.emission   = np.asarray(fastspecfit_data[4].data[fastspecfit_indices], dtype=np.float32)
+        self.flux       = self.coadd_data - self.continuum
+        self.emission   = np.asarray(fastspecfit_data[4].data[fastspecfit_indices], dtype=np.float32)
 
         
         # Calculate and store color magnitudes
@@ -77,12 +77,13 @@ class Spectrum:
         # idx may be a boolean mask or integer array
         self.targetID   = self.targetID[idx]
         self.n_spectra  = len(self.targetID)
-        self.df        = self.df.iloc[idx].reset_index(drop=True)
+        self.df         = self.df[idx].reset_index(drop=True)
         self.coadd_data = self.coadd_data[idx]
         self.ivar       = self.ivar[idx]
         self.mask       = self.mask[idx]
         self.continuum  = self.continuum[idx]
-        # self.emission    = self.emission[idx]
+        self.emission   = self.emission[idx]
+        self.flux       = self.flux[idx]
     
         if hasattr(self, "color_mag"):      self.color_mag = self.color_mag[idx]
         if hasattr(self, "smoothed_flux"):  self.smoothed_flux = self.smoothed_flux[idx]
@@ -116,11 +117,9 @@ class Spectrum:
         else:
             # Handle list or numpy array of targetIDs
             try:
-                # Use a list comprehension for efficiency
-                indices = [self._id_to_idx[int(tid)] for tid in targetID]
-                # Return a numpy array if the input was one
-                if isinstance(targetID, np.ndarray):
-                    return np.array(indices)
+                # Use a vectorized approach for performance and robustness
+                targetID_arr = np.asarray(targetID, dtype=int)
+                indices = np.array([self._id_to_idx[tid] for tid in targetID_arr])
                 return indices
             except KeyError as e:
                 # If any ID is not found, raise an error

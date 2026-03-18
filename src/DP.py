@@ -21,6 +21,12 @@ class DP:
         with open(fname, 'w+') as f:
             for tid in df['TARGETID']:
                 f.write(f"{tid}\n")
+                
+    def record_ra_dec(self, df: pd.DataFrame, fname: str):
+        with open(fname, 'w+') as f:
+            f.write('#? ra dec\n')
+            for ra, dec in zip(df['RA'], df['DEC']):
+                f.write(f"{ra} {dec}\n")
 
     def reconstruct_fit(self, data_class:Spectrum, id=None):
         idx = data_class.id2index(id)
@@ -176,7 +182,7 @@ class DP:
             """
             p_value, df_line, params_2comp, params_1comp = self.fit_dp(data_class=data_class, id=target_id)
             idx = data_class.id2index(target_id)
-            Z, RA, DEC, LOGSFR, LOGM = data_class.df.iloc[idx][['z', 'RA', 'DEC', 'LOGSFR', 'LOGM']]
+            Z, RA, DEC, LOGSFR, LOGM = data_class.df.iloc[idx][['Z', 'RA', 'DEC', 'LOGSFR', 'LOGM']]
             lam = desi_wavelength / (1 + Z)
             model_1comp = np.sum([
                 model_vel(lam, gaussian_parms=params_1comp['gaussian_params'][i]) for i in range(len(params_1comp['gaussian_params']))
@@ -291,7 +297,7 @@ class DP:
         model_1comp = model_1comp[dp_sample.index]
         left_2comp = left_2comp[dp_sample.index]
         right_2comp = right_2comp[dp_sample.index]
-
+        dp_sample.drop(columns=dp_rank_cols, inplace=True)
         return dp_sample, model_1comp, left_2comp, right_2comp
 
     def select_nbcs(self, dp_parent: pd.DataFrame, dp_sample: pd.DataFrame):

@@ -43,13 +43,18 @@ class FitSpectrum:
         
         return unmasked_array
     
+    
+    
+    #
+    # this is broken
+    #
     def label_emission_lines(self, data_class:Spectrum, s_2_n=3):
         n_spectra = data_class.n_spectra
         
-        lam_obs = desi_wavelength
         fluxes = data_class.flux
+        # fluxes = data_class.emission
         ivars = data_class.ivar
-        mask = data_class.mask
+        masks = data_class.mask
 
         OII_labels = []
         OIII_labels = []
@@ -58,20 +63,21 @@ class FitSpectrum:
         SII_labels = []
         Hbeta_labels = []
         for idx in range(n_spectra):
-            lam_rest = lam_obs / (1 + data_class.df.iloc[idx]['Z'])
-            flux = fluxes[idx]
-            ivar = ivars[idx]
-            mask = mask[idx]
+            lam_rest = desi_wavelength / (1 + data_class.df.iloc[idx]['Z'])
+            flux_ini = fluxes[idx]
+            ivar_ini = ivars[idx]
+            mask = masks[idx]
             for l0, label in zip([OII_rest[1], OIII_rest[1], Halpha_rest[0], NII_rest[1], Hbeta_rest[0], SII_rest[0]],
                                 [OII_labels, OIII_labels, Halpha_labels, NII_labels, Hbeta_labels, SII_labels]):
                 lam         = self.mask_bad_pixel(lam_rest, mask)
-                emission    = self.mask_bad_pixel(flux, mask)
-                ivar        = self.mask_bad_pixel(ivar, mask)
+                emission    = self.mask_bad_pixel(flux_ini, mask)
+                ivar        = self.mask_bad_pixel(ivar_ini, mask)
 
+                
                 crop_flux = emission[(lam >= l0 - 2) & (lam <= l0 + 2)]
                 line_flux = np.max(crop_flux) if len(crop_flux) > 0 else 0
 
-                crop_ivar = ivar[((lam >= l0 - 10) & (lam <= l0 - 2)) | ((lam >= l0 + 2) & (lam <= l0 + 10))]
+                crop_ivar = ivar[(lam >= l0 - 2) & (lam <= l0 + 2)]
                 sigma_b = np.sqrt(np.mean((1/np.sqrt(crop_ivar))**2)) # rms of the background noise
 
 
@@ -106,7 +112,8 @@ class FitSpectrum:
                                id=None, two_component=False, w_dz=False):
         
         idx = data_class.id2index(id)
-        z = float(data_class.df.iloc[idx]['Z'])
+        df = data_class.df.iloc[idx]
+        z = float(df['Z'])
         
         
         line_choices = {
@@ -120,6 +127,7 @@ class FitSpectrum:
         crop_region = []
         lines_to_fit = []
         line_ratios = []
+        
         
         for detected_line in ['OII', 'Hbeta', 'OIII', 'Halpha', 'SII']:
             crop_region.append(line_choices[detected_line][0])
@@ -136,29 +144,30 @@ class FitSpectrum:
                     count += 1
             return count
 
-        n_lines_total_region = [count_lines(region) for region in lines_to_fit] # doublet is considered to be 2 lines
-
-        n_lines_fit_regions = [len(lines_to_fit[i]) for i in range(len(lines_to_fit))] # doublet is considered to be 1 line
+        n_lines_total_region = [count_lines(region) for region in lines_to_fit]
+        
+        n_lines_fit_regions = [len(lines_to_fit[i]) for i in range(len(lines_to_fit))]
         n_lines_fit         = int(np.sum(n_lines_fit_regions))
         nline_start_indices = np.concatenate(([0], np.cumsum(n_lines_fit_regions)[:-1]))
 
-        lam = desi_wavelength / (1 + data_class.df.iloc[idx]['Z'])
-        flux, ivar, mask = data_class.flux[idx], data_class.ivar[idx], data_class.mask[idx]
-
-
-        lam     = self.mask_bad_pixel(lam, mask)
-        flux    = self.mask_bad_pixel(flux, mask)
-        ivar    = self.mask_bad_pixel(ivar, mask)
+        lam = desi_wavelength / (1+z)
+        flux, ivar, conti = data_class.flux[idx, :], data_class.ivar[idx, :], data_class.continuum[idx, :]
+        lam     = self.mask_bad_pixel(lam, data_class.mask[idx, :])
+        flux    = self.mask_bad_pixel(flux, data_class.mask[idx, :])
+        ivar    = self.mask_bad_pixel(ivar, data_class.mask[idx, :])
+        conti   = self.mask_bad_pixel(conti, data_class.mask[idx, :])
 
         slice_indices = []
         lams = []
         fluxes = []
         sigmas = []
+        contis = []
         for i in range(len(crop_region)):
             slice_mask = (lam >= crop_region[i][0]) & (lam <= crop_region[i][1])
             lams.append(lam[slice_mask])
             fluxes.append(flux[slice_mask])
             sigmas.append(np.sqrt(1/np.abs(ivar[slice_mask])))
+            contis.append(conti[slice_mask])
             slice_indices.append(np.sum(slice_mask))
 
         if len(slice_indices) > 1:
@@ -169,7 +178,7 @@ class FitSpectrum:
         combine_lam     = np.concatenate(lams)
         combine_flux    = np.concatenate(fluxes)
         combine_sigma   = np.concatenate(sigmas)
-
+        combine_conti   = np.concatenate(contis)
 
         def unpack_params(params):
             gaussian_parms = [[] for _ in range(len(crop_region))] # OII, Hbeta, OIII, Halpha, SII
@@ -301,13 +310,13 @@ class FitSpectrum:
         
 
         dz_init, dz_upper, dz_lower                     = 0, 1e-3, -1e-3
-        sigma_1_init, sigma_1_upper, sigma_1_lower      = 30, 500, 0.001
-        amp_init, amp_upper, amp_lower                  = [np.max(combine_flux)/2]*n_lines_fit, [np.max(combine_flux)]*n_lines_fit, [0]*n_lines_fit
+        sigma_1_init, sigma_1_upper, sigma_1_lower      = 30, 500, 0.01
+        amp_init, amp_upper, amp_lower                  = [np.max(combine_flux+combine_conti)/2]*n_lines_fit, [np.max(combine_flux+combine_conti)]*n_lines_fit, [0]*n_lines_fit
         if two_component:
             sigma_2_init, sigma_2_upper, sigma_2_lower  = sigma_1_init, sigma_1_upper, sigma_1_lower
             dv_r_init, dv_r_upper, dv_r_lower           =  5, 500,    0     # right component
             dv_l_init, dv_l_upper, dv_l_lower           = -5,   0, -500     # left component
-            amp_init, amp_upper, amp_lower              = [np.max(combine_flux)/2]*int(n_lines_fit*2), [np.max(combine_flux)]*int(n_lines_fit*2), [0]*int(n_lines_fit*2)
+            amp_init, amp_upper, amp_lower              = [np.max(combine_flux+combine_conti)/2]*int(n_lines_fit*2), [np.max(combine_flux+combine_conti)]*int(n_lines_fit*2), [0]*int(n_lines_fit*2)
 
         if two_component:
             if w_dz:
@@ -372,5 +381,3 @@ class FitSpectrum:
             params['left_amps'],   params['right_amps'] = split_components(amps)
             params['left_lam0s'], params['right_lam0s'] = split_components(lam0s)
         return params, (combine_lam, combine_flux, combine_sigma), slice_indices, n_lines_fit
-
-
