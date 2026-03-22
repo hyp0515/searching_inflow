@@ -63,11 +63,11 @@ class FitSpectrum:
         SII_labels = []
         Hbeta_labels = []
         for idx in range(n_spectra):
-            lam_rest = desi_wavelength / (1 + data_class.df.iloc[idx]['Z'])
-            flux_ini = fluxes[idx]
-            ivar_ini = ivars[idx]
-            mask = masks[idx]
-            for l0, label in zip([OII_rest[1], OIII_rest[1], Halpha_rest[0], NII_rest[1], Hbeta_rest[0], SII_rest[0]],
+            lam_rest = desi_wavelength / (1 + float(data_class.df.iloc[idx]['Z']))
+            flux_ini = fluxes[idx, :]
+            ivar_ini = ivars[idx, :]
+            mask = masks[idx, :]
+            for l0, label in zip([np.mean(OII_rest), OIII_rest[1], Halpha_rest[0], NII_rest[1], Hbeta_rest[0], SII_rest[0]],
                                 [OII_labels, OIII_labels, Halpha_labels, NII_labels, Hbeta_labels, SII_labels]):
                 lam         = self.mask_bad_pixel(lam_rest, mask)
                 emission    = self.mask_bad_pixel(flux_ini, mask)
@@ -75,13 +75,15 @@ class FitSpectrum:
 
                 
                 crop_flux = emission[(lam >= l0 - 2) & (lam <= l0 + 2)]
-                line_flux = np.max(crop_flux) if len(crop_flux) > 0 else 0
-
                 crop_ivar = ivar[(lam >= l0 - 2) & (lam <= l0 + 2)]
-                sigma_b = np.sqrt(np.mean((1/np.sqrt(crop_ivar))**2)) # rms of the background noise
+                if len(crop_flux) > 0:
+                    line_flux = np.max(crop_flux)
+                    sigma_b = np.sqrt(np.mean((1/np.sqrt(crop_ivar))**2)) # mean of the background noise
+                else:
+                    line_flux = 0
+                    sigma_b = 1e10
 
-
-                if line_flux >= s_2_n/sigma_b:
+                if line_flux >= s_2_n*sigma_b:
                     label.append(True)
                 else:
                     label.append(False)
@@ -310,7 +312,7 @@ class FitSpectrum:
         
 
         dz_init, dz_upper, dz_lower                     = 0, 1e-3, -1e-3
-        sigma_1_init, sigma_1_upper, sigma_1_lower      = 30, 500, 0.01
+        sigma_1_init, sigma_1_upper, sigma_1_lower      = 30, 500, 0.001
         amp_init, amp_upper, amp_lower                  = [np.max(combine_flux+combine_conti)/2]*n_lines_fit, [np.max(combine_flux+combine_conti)]*n_lines_fit, [0]*n_lines_fit
         if two_component:
             sigma_2_init, sigma_2_upper, sigma_2_lower  = sigma_1_init, sigma_1_upper, sigma_1_lower

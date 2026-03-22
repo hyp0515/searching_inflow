@@ -7,6 +7,9 @@ from .misc import *
 from .SPECTRUM import Spectrum
 from .FITSPECTRUM import FitSpectrum
 from astropy.table import Table
+import warnings
+from astropy.cosmology import Planck18 as cosmo
+import astropy.units as u
 
 FIT = FitSpectrum()
 
@@ -85,10 +88,10 @@ class DP:
         delta_dv = np.abs(dv_r - dv_l)
         
 
-        residual_region = np.split(residual_2comp, slice_indices)
-        sigmab_region = [np.std(residual_region[i]) if residual_region[i].size > 1 else 0 for i in range(len(residual_region))]
-        # noise_region = np.split(combine_sigma, slice_indices)
-        # sigmab_region = [np.sqrt(np.mean(noise_region[i]**2)) if noise_region[i].size > 1 else 0 for i in range(len(noise_region))]
+        # residual_region = np.split(residual_2comp, slice_indices)
+        # sigmab_region = [np.std(residual_region[i]) if residual_region[i].size > 1 else 0 for i in range(len(residual_region))]
+        noise_region = np.split(combine_sigma, slice_indices)
+        sigmab_region = [np.sqrt(np.mean(noise_region[i]**2)) if noise_region[i].size > 1 else -1e10 for i in range(len(noise_region))]
 
 
         
@@ -104,6 +107,7 @@ class DP:
         lams_2compR = []
         flux_2compR = []
         
+        noise_b = []
         for i, amp in enumerate(params_1comp['amps']):
             for j in range(len(amp)):
                 
@@ -131,20 +135,16 @@ class DP:
                                                                     params_2comp['dv_r'], 
                                                                     params_2comp['sigma_r'])])
                 model_2comp = model_2comp_l + model_2comp_r
+                noise_b.append(3*sigmab_region[i]*np.sqrt(2*np.pi)*params_1comp['sigma']*params_1comp['lam0s'][i][j]/c)
                 try:
                     line_snr.append(np.max(model_2comp)/sigmab_region[i])
                 except:
                     line_snr.append(0)
-
-        line_snr_flat = np.array(line_snr)
-        line_snr_rank = np.full(line_snr_flat.shape, -1, dtype=int)
-        non_zero_indices = np.where(line_snr_flat > 0)[0]
-
-        if non_zero_indices.size > 0:
-            detected_snr = line_snr_flat[non_zero_indices]
-            sorted_indices_of_detected = np.argsort(detected_snr)[::-1]
-            ranks = np.arange(len(detected_snr))
-            line_snr_rank[non_zero_indices[sorted_indices_of_detected]] = ranks
+                    
+        noise_b = np.array(noise_b)
+        line_snr_flat = np.where(np.array(line_snr) > 3, np.array(line_snr), -1)
+        # non_zero_indices = np.where(line_snr_flat > 0)[0]
+        # line_snr_flat[~non_zero_indices] = -1
         
         line_cols = ['OII3729', 'OII3726',
                     'Hbeta',
@@ -158,9 +158,9 @@ class DP:
                                  'flux_2compL': flux_2compL, 
                                  'flux_2compR': flux_2compR,
                                  'dp': dp_detections,
-                                 'dp_rank': line_snr_rank})
+                                 'noise_b': noise_b.astype(np.float32),
+                                 'dp_snr': line_snr_flat.astype(np.float32)})
         df_line = pd.merge(df_1comp, df_2comp, on='lam0', how='outer').sort_values(by='lam0').reset_index(drop=True)
-        
         return p_value, df_line, params_2comp, params_1comp
 
     
@@ -170,11 +170,12 @@ class DP:
                     'OIII4959', 'OIII5007',
                     'NII6548', 'Halpha', 'NII6583', 
                     'SII6716', 'SII6731']
-        dp_cols = [f'{col}_dp' for col in line_cols]
-        dp_rank_cols = [f'{col}_rank' for col in line_cols]
-        flux_1comp_cols = [f'{col}_1comp' for col in line_cols]
-        flux_2compL_cols = [f'{col}_2compL' for col in line_cols]
-        flux_2compR_cols = [f'{col}_2compR' for col in line_cols]
+        dp_cols = [f'{col}_DP' for col in line_cols]
+        noise_b_cols = [f'{col}_3NOISE' for col in line_cols]
+        dp_snr_cols = [f'{col}_SNR' for col in line_cols]
+        flux_1comp_cols = [f'{col}_FLUX_1COMP' for col in line_cols]
+        flux_2compL_cols = [f'{col}_FLUX_2COMP_L' for col in line_cols]
+        flux_2compR_cols = [f'{col}_FLUX_2COMP_R' for col in line_cols]
 
         def process_target(target_id):
             """
@@ -203,12 +204,12 @@ class DP:
                           'Z': Z.astype(np.float32),
                        'LOGM': LOGM.astype(np.float32),
                      'LOGSFR': LOGSFR.astype(np.float32),
-                       'dv_r': params_2comp['dv_r'].astype(np.float32),
-                       'dv_l': params_2comp['dv_l'].astype(np.float32),
-                    'sigma_r': params_2comp['sigma_r'].astype(np.float32),
-                    'sigma_l': params_2comp['sigma_l'].astype(np.float32),
-                'sigma_1comp': params_1comp['sigma'].astype(np.float32),
-                    'p_value': p_value.astype(np.float32),
+                       'DV_R': params_2comp['dv_r'].astype(np.float32),
+                       'DV_L': params_2comp['dv_l'].astype(np.float32),
+                    'SIGMA_R': params_2comp['sigma_r'].astype(np.float32),
+                    'SIGMA_L': params_2comp['sigma_l'].astype(np.float32),
+                'SIGMA_1COMP': params_1comp['sigma'].astype(np.float32),
+                    'P_VALUE': p_value.astype(np.float32),
                 'model_1comp': model_1comp.astype(np.float32),
                  'left_2comp': left_2comp.astype(np.float32),
                 'right_2comp': right_2comp.astype(np.float32)
@@ -217,19 +218,20 @@ class DP:
             data.update(dict(zip(flux_2compL_cols, df_line['flux_2compL'].to_numpy().astype(np.float32))))
             data.update(dict(zip(flux_2compR_cols, df_line['flux_2compR'].to_numpy().astype(np.float32))))
             data.update(dict(zip(dp_cols, df_line['dp'])))
-            data.update(dict(zip(dp_rank_cols, df_line['dp_rank'])))
+            data.update(dict(zip(noise_b_cols, df_line['noise_b'])))
+            data.update(dict(zip(dp_snr_cols, df_line['dp_snr'])))
             return data
         # Use joblib to parallelize the processing
         results = Parallel(n_jobs=n_jobs)(delayed(process_target)(target_id) for target_id in tqdm(data_class.targetID))
         
         dp_parent = pd.DataFrame(results)
-        
+
         model_1comp = np.array(dp_parent['model_1comp'].to_list())
         left_2comp  = np.array(dp_parent['left_2comp'].to_list())
         right_2comp = np.array(dp_parent['right_2comp'].to_list())
         dp_parent.drop(columns=['model_1comp', 'left_2comp', 'right_2comp'], inplace=True)
         return dp_parent, model_1comp, left_2comp, right_2comp
-        
+    
     
     def select_dp_sample(self, dp_parent: pd.DataFrame, model_1comp, left_2comp, right_2comp):
         # Criteria 1: p_value < 0.05
@@ -239,17 +241,18 @@ class DP:
         # dp_candidate = dp_parent[criteria_1 & criteria_2].copy()
         
         
-        criteria_1 = dp_parent['p_value'] < 0.05
+        criteria_1 = dp_parent['P_VALUE'] < 0.05
         # criteria_2 = (dp_parent['dv_r'] - dp_parent['dv_l']).abs() > 3 * c * 0.8 / (Halpha_rest[0] * (1 + dp_parent['Z']))
         dp_candidate = dp_parent[criteria_1].copy()
 
-        dp_cols = ['OII3726_dp', 'OII3729_dp',
-                'Hbeta_dp',
-                'OIII4959_dp', 'OIII5007_dp',
-                'NII6548_dp', 'NII6583_dp', 'Halpha_dp', 
-                'SII6716_dp', 'SII6731_dp']
-        dp_rank_cols = [f'{col[:-3]}_rank' for col in dp_cols]
-        
+        line_cols = ['OII3726', 'OII3729',
+                    'Hbeta',
+                    'OIII4959', 'OIII5007',
+                    'NII6548', 'Halpha', 'NII6583', 
+                    'SII6716', 'SII6731']
+        dp_cols = [f'{col}_DP' for col in line_cols]
+        dp_snr_cols = [f'{col}_SNR' for col in line_cols]
+
 
         def get_dp_info(row):
             """
@@ -260,20 +263,19 @@ class DP:
             - Otherwise, counts consecutive lines with double peaks starting from the brightest
               and returns the count and a list of the corresponding line names.
             """
-            # Create a list of (rank, dp_status, line_name) tuples for detected lines (rank != -1)
+            # Create a list of (snr, dp_status, line_name) tuples for detected lines (snr != -1)
             line_info = []
-            for rank_col, dp_col in zip(dp_rank_cols, dp_cols):
-                rank = row[rank_col]
-                if rank != -1:
-                    line_name = dp_col[:-3]  # Remove '_dp' suffix
-                    line_info.append((rank, row[dp_col], line_name))
-                
+            for snr_col, line_col in zip(dp_snr_cols, line_cols):
+                snr = row[snr_col]
+                if snr > -1:
+                    line_info.append((snr, row[line_col+'_DP'], line_col))
+
             # If no lines were detected, there are no DPs to count.
             if not line_info:
                 return 0, []
             
             # Sort by rank (the first element of the tuple)
-            line_info.sort()
+            line_info.sort(reverse=True)
 
             # Check if the brightest line (first in the sorted list) has a double peak
             if not line_info[0][1]:  # line_info[0][1] is the dp_status
@@ -294,11 +296,15 @@ class DP:
         # Apply the function to each row to create the new columns
         dp_candidate['dp_count'], _ = zip(*dp_candidate.apply(get_dp_info, axis=1))
         dp_sample = dp_candidate[(dp_candidate['dp_count'] > 0)].copy()
+        
         model_1comp = model_1comp[dp_sample.index]
         left_2comp = left_2comp[dp_sample.index]
         right_2comp = right_2comp[dp_sample.index]
-        dp_sample.drop(columns=dp_rank_cols, inplace=True)
+
+        # dp_sample.drop(columns=dp_snr_cols, inplace=True)
         return dp_sample, model_1comp, left_2comp, right_2comp
+
+    
 
     def select_nbcs(self, dp_parent: pd.DataFrame, dp_sample: pd.DataFrame):
         # control sample
@@ -328,7 +334,7 @@ class DP:
         
         return cs_df, nbcs_df, cs_nbcs_df
 
-    def bpt_classification(self, df: pd.DataFrame, sigmas=None, model_1comp=None, left_2comp=None, right_2comp=None, two_comp=True):
+    def bpt_classification(self, df: pd.DataFrame, two_comp=True):
         classification_map = {
             1: 'SF', 4: 'COMP', 16: 'AGN', 64: 'LINER', 256: 'unclassified',
             2: 'double SF', 8: 'double COMP', 32: 'double AGN', 128: 'double LINER',
@@ -337,32 +343,27 @@ class DP:
             257: 'SF+uncertain', 260: 'COMP+uncertain', 272: 'AGN+uncertain', 320: 'LINER+uncertain',
             512: 'unclassified'
         }
+
+        line_cols = ['OIII5007', 'Hbeta', 'NII6583', 'Halpha']
         
-        line_cols = ['OII3726', 'OII3729',
-                    'Hbeta',
-                    'OIII4959', 'OIII5007',
-                    'NII6548', 'Halpha', 'NII6583', 
-                    'SII6716', 'SII6731']
-        flux_1comp_cols = [f'{col}_1comp' for col in line_cols]
-        flux_2compL_cols = [f'{col}_2compL' for col in line_cols]
-        flux_2compR_cols = [f'{col}_2compR' for col in line_cols]
         
-        def bpt(lam, flux, sigma, offset):
+        def bpt(fluxes, snrs, noises):
             unavailable_lines = []
             line_fluxes = []
-            for i, lam0 in enumerate([Hbeta_rest[0], OIII_rest[1], Halpha_rest[0], NII_rest[1]]):
-                line_flux_peak = np.max(flux[(lam>lam0*(1+offset)-0.8) & (lam<lam0*(1+offset)+0.8)])
-                line_noise = np.median(sigma[(lam>lam0*(1+offset)-0.8) & (lam<lam0*(1+offset)+0.8)])
-                if line_flux_peak < 3*line_noise:
+            for i, (snr, flux, noise) in enumerate(zip(snrs, fluxes, noises)):
+                if snr == -1:
                     unavailable_lines.append(i)
-                    line_fluxes.append(line_noise)
+                    line_fluxes.append(noise)
                 else:
-                    line_fluxes.append(line_flux_peak)
-                if len(unavailable_lines) > 1:
-                    return 256, []
+                    line_fluxes.append(flux if flux != 0 else noise)
+                    
+            if len(unavailable_lines) > 1:
+                return 256, []
 
-            oiii_hbeta = np.log10(line_fluxes[1]/line_fluxes[0])
-            nii_halpha = np.log10(line_fluxes[3]/line_fluxes[2])
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                oiii_hbeta = np.log10(fluxes[0]/fluxes[1])
+                nii_halpha = np.log10(fluxes[2]/fluxes[3])
 
             sf_boundary = 0.61/(nii_halpha-0.05)+1.30
             comp_boundary = 0.61/(nii_halpha-0.47)+1.19
@@ -381,31 +382,105 @@ class DP:
                 return 256, line_fluxes
 
 
-        df['BPT_1comp'] = [0] * len(df)
-        df['BPT_2comp'] = [0] * len(df)
+        df['BPT_1COMP'] = [0] * len(df)
+        df['BPT_2COMP_L'] = [0] * len(df)
+        df['BPT_2COMP_R'] = [0] * len(df)
+        df['BPT_2COMP'] = [0] * len(df)
 
         bpt_1comp = []
-        bpt_2comp = []
+        bpt_2compL = []
+        bpt_2compR = []
         for i in range(len(df)):
-            lam = desi_wavelength/(1 + df['Z'][i])
-            bpt_class_val, _ = bpt(lam, model_1comp[i], sigmas[i, :], 0)
+            line_snr = [df.iloc[i][f'{col}_SNR'] for col in line_cols]
+            line_noise_b = [df.iloc[i][f'{col}_3NOISE'] for col in line_cols]
+            flux_1comp = [df.iloc[i][f'{col}_FLUX_1COMP'] for col in line_cols]
+            flux_2compL = [df.iloc[i][f'{col}_FLUX_2COMP_L'] for col in line_cols]
+            flux_2compR = [df.iloc[i][f'{col}_FLUX_2COMP_R'] for col in line_cols]
+            bpt_class_val, _ = bpt(flux_1comp, line_snr, line_noise_b)
             bpt_1comp.append(bpt_class_val)
-        
-            if two_comp is True:
-                bpt_class_val = 0
-                models = [left_2comp[i], right_2comp[i]]
-                offsets = [df.iloc[i]['dv_l']/c, df.iloc[i]['dv_r']/c]
-                for j, (model, offset) in enumerate(zip(models, offsets)):
-                    classification, line_fluxes = bpt(lam, model, sigmas[i, :], offset)
-                    bpt_class_val += classification
-                bpt_2comp.append(bpt_class_val)
-            
-        df['BPT_1comp'] = bpt_1comp
+
+            bpt_class_val, _ = bpt(flux_2compL, line_snr, line_noise_b)
+            bpt_2compL.append(bpt_class_val)
+
+            bpt_class_val, _ = bpt(flux_2compR, line_snr, line_noise_b)
+            bpt_2compR.append(bpt_class_val)
+
+        df['BPT_1COMP'] = bpt_1comp
         if two_comp is True:
-            df['BPT_2comp'] = bpt_2comp
+            df['BPT_2COMP_L'] = bpt_2compL
+            df['BPT_2COMP_R'] = bpt_2compR
+            df['BPT_2COMP'] = df['BPT_2COMP_L'] + df['BPT_2COMP_R']
         return df
 
 
+    # def extinction(self, df:pd.DataFrame, model_1comp, left_2comp, right_2comp):
+    #     # Placeholder for extinction correction logic
+    #     # This function should apply extinction correction to the fluxes in the DataFrame
+    #     # and update the model_1comp, left_2comp, and right_2comp arrays accordingly.
+    #     # The actual implementation will depend on the specific extinction law and parameters used.
+    #     return df, model_1comp, left_2comp, right_2comp
+
+    def estimate_SFR(self, df: pd.DataFrame, two_comp=True):
+        # Placeholder for SFR estimation logic
+        # This function should estimate the SFR based on the provided DataFrame
+        # and update the relevant columns accordingly.
+        def sfr(flux_halpha, flux_hbeta, flux_hbeta_noise, z):
+            """
+            the unit of the flux is:
+            1e-17 * erg / cm^2 / s
+            """
+            
+            if flux_hbeta < flux_hbeta_noise:
+                flux_hbeta = flux_hbeta_noise
+            
+            ebv = 1.97 * np.log10((flux_halpha/flux_hbeta) / 2.86)
+            A_halpha = 3.33 * ebv
+            flux_intrinsic = flux_halpha / (10**(A_halpha/-2.5)) * 1e-17
+            flux_adjusted = flux_intrinsic * (1+z)
+            
+            luminous_distance = cosmo.luminosity_distance(z).to('cm').value
+            lum_halpha = 4 * np.pi * (luminous_distance**2) * flux_adjusted
+            sfr = 5.5e-42 * lum_halpha
+            return sfr
+
+        df['LOGSFR_1COMP'] = [np.nan] * len(df)
+        df['LOGSFR_2COMP'] = [np.nan] * len(df)
+
+        sfr_1comp = []
+        sfr_2compL = []
+        sfr_2compR = []
+        for i in range(len(df)):
+            z = df.iloc[i]['Z']
+
+            if df.iloc[i]['Halpha_SNR'] > 0:
+                sfr_1comp.append(sfr(df.iloc[i]['Halpha_FLUX_1COMP'], df.iloc[i]['Hbeta_FLUX_1COMP'], df.iloc[i]['Hbeta_3NOISE'], z))
+            else:
+                sfr_1comp.append(0)
+
+            if two_comp:
+                if df.iloc[i]['Halpha_SNR'] > 0:
+                    sfr_2compL.append(sfr(df.iloc[i]['Halpha_FLUX_2COMP_L'], df.iloc[i]['Hbeta_FLUX_2COMP_L'], df.iloc[i]['Hbeta_3NOISE'], z))
+                else:
+                    sfr_2compL.append(0)
+
+                if df.iloc[i]['Halpha_SNR'] > 0:
+                    sfr_2compR.append(sfr(df.iloc[i]['Halpha_FLUX_2COMP_R'], df.iloc[i]['Hbeta_FLUX_2COMP_R'], df.iloc[i]['Hbeta_3NOISE'], z))
+                else:
+                    sfr_2compR.append(0)
+
+        sfr_1comp = np.array(sfr_1comp)
+        sfr_1comp = np.where((sfr_1comp > 0), np.log10(sfr_1comp), -15)
+        sfr_1comp = np.where(sfr_1comp > -15, sfr_1comp, -15)
+        df['LOGSFR_1COMP'] = sfr_1comp
+        
+        if two_comp:
+            sfr_2comp = np.array(sfr_2compL) + np.array(sfr_2compR)
+            sfr_2comp = np.where((sfr_2comp > 0), np.log10(sfr_2comp), -15)
+            sfr_2comp = np.where(sfr_2comp > -15, sfr_2comp, -15)
+            df['LOGSFR_2COMP'] = sfr_2comp
+        
+        
+        return df
 
     def get_catalog(self, df: pd.DataFrame, fname: str, model_1comp=None, left_2comp=None, right_2comp=None):
         hdul = fits.HDUList()
