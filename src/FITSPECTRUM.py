@@ -119,11 +119,11 @@ class FitSpectrum:
         
         
         line_choices = {
-            'OII'       : ([OII_rest[0]-20, OII_rest[1]+20], [(OII_rest[0], OII_rest[1])], 1/1.33),  # fixed ratio for [OII]3727/3729
-            'Hbeta'     : ([Hbeta_rest[0]-20, Hbeta_rest[0]+20], [Hbeta_rest[0]], 0),
-            'OIII'      : ([OIII_rest[0]-20, OIII_rest[1]+20], [(OIII_rest[0], OIII_rest[1])], 1/3.00),  # fixed ratio for [OIII]4959/5007
-            'Halpha'    : ([NII_rest[0]-20, NII_rest[1]+20], [(NII_rest[0], NII_rest[1]), Halpha_rest[0]], 1/3.05), # fixed ratio for [NII]
-            'SII'       : ([SII_rest[0]-20, SII_rest[1]+20], [SII_rest[0], SII_rest[1]], 0)
+            'OII'       : ([OII_rest[0]-40, OII_rest[1]+40], [(OII_rest[0], OII_rest[1])], 1/1.33),  # fixed ratio for [OII]3727/3729
+            'Hbeta'     : ([Hbeta_rest[0]-40, Hbeta_rest[0]+40], [Hbeta_rest[0]], 0),
+            'OIII'      : ([OIII_rest[0]-40, OIII_rest[1]+40], [(OIII_rest[0], OIII_rest[1])], 1/3.00),  # fixed ratio for [OIII]4959/5007
+            'Halpha'    : ([NII_rest[0]-40, NII_rest[1]+40], [(NII_rest[0], NII_rest[1]), Halpha_rest[0]], 1/3.05), # fixed ratio for [NII]
+            'SII'       : ([SII_rest[0]-40, SII_rest[1]+40], [SII_rest[0], SII_rest[1]], 0)
         }
         
         crop_region = []
@@ -164,12 +164,16 @@ class FitSpectrum:
         fluxes = []
         sigmas = []
         contis = []
+        conti_adjs = []
         for i in range(len(crop_region)):
             slice_mask = (lam >= crop_region[i][0]) & (lam <= crop_region[i][1])
+            conti_adjust_estimate_mask = ((lam >= crop_region[i][0]) & (lam <= crop_region[i][0]+10)) | ((lam <= crop_region[i][1]) & (lam >= crop_region[i][1]-10))
+            conti_adjust_estimate = np.median(flux[conti_adjust_estimate_mask]) if np.any(conti_adjust_estimate_mask) else 0
             lams.append(lam[slice_mask])
-            fluxes.append(flux[slice_mask])
+            fluxes.append(flux[slice_mask]-conti_adjust_estimate)
             sigmas.append(np.sqrt(1/np.abs(ivar[slice_mask])))
             contis.append(conti[slice_mask])
+            conti_adjs.append(conti_adjust_estimate)
             slice_indices.append(np.sum(slice_mask))
 
         if len(slice_indices) > 1:
@@ -312,12 +316,12 @@ class FitSpectrum:
         
 
         dz_init, dz_upper, dz_lower                     = 0, 1e-3, -1e-3
-        sigma_1_init, sigma_1_upper, sigma_1_lower      = 30, 500, 0.001
+        sigma_1_init, sigma_1_upper, sigma_1_lower      = 30, 800, 0.001
         amp_init, amp_upper, amp_lower                  = [np.max(combine_flux+combine_conti)/2]*n_lines_fit, [np.max(combine_flux+combine_conti)]*n_lines_fit, [0]*n_lines_fit
         if two_component:
             sigma_2_init, sigma_2_upper, sigma_2_lower  = sigma_1_init, sigma_1_upper, sigma_1_lower
-            dv_r_init, dv_r_upper, dv_r_lower           =  5, 500,    0     # right component
-            dv_l_init, dv_l_upper, dv_l_lower           = -5,   0, -500     # left component
+            dv_r_init, dv_r_upper, dv_r_lower           =  5, 800,    0     # right component
+            dv_l_init, dv_l_upper, dv_l_lower           = -5,   0, -800     # left component
             amp_init, amp_upper, amp_lower              = [np.max(combine_flux+combine_conti)/2]*int(n_lines_fit*2), [np.max(combine_flux+combine_conti)]*int(n_lines_fit*2), [0]*int(n_lines_fit*2)
 
         if two_component:
@@ -382,4 +386,4 @@ class FitSpectrum:
             params['left_comp'],   params['right_comp'] = split_components(gaussian_parms)
             params['left_amps'],   params['right_amps'] = split_components(amps)
             params['left_lam0s'], params['right_lam0s'] = split_components(lam0s)
-        return params, (combine_lam, combine_flux, combine_sigma), slice_indices, n_lines_fit
+        return params, (combine_lam, combine_flux, combine_sigma), slice_indices, n_lines_fit, conti_adjs

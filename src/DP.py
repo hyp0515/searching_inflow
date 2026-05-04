@@ -36,14 +36,14 @@ class DP:
         lam = desi_wavelength / (1 + data_class.df.iloc[idx]['Z'])
 
 
-        params_1comp, _, slice_indices, _ = FIT.fit_multi_emission_vel(data_class=data_class, id=id, two_component=False, w_dz=False)
+        params_1comp, _, slice_indices, _, _ = FIT.fit_multi_emission_vel(data_class=data_class, id=id, two_component=False, w_dz=False)
         model_1comp = np.sum([
                     model_vel(lam, gaussian_parms=params_1comp['gaussian_params'][i]) 
                     for i in range(len(slice_indices)+1)
                 ], axis=0)
 
 
-        params_2comp, _, slice_indices, _ = FIT.fit_multi_emission_vel(data_class=data_class, id=id, two_component=True, w_dz=False)
+        params_2comp, _, slice_indices, _, _ = FIT.fit_multi_emission_vel(data_class=data_class, id=id, two_component=True, w_dz=False)
         left_2comp = np.sum([
             model_vel(lam, gaussian_parms=params_2comp['left_comp'][i]) for i in range(len(slice_indices)+1)
         ], axis=0)
@@ -54,18 +54,18 @@ class DP:
         return model_1comp, left_2comp, right_2comp
     
     def fit_dp(self, data_class:Spectrum, id=None):
-        
-        params_1comp, (combine_lam, combine_flux, combine_sigma), slice_indices, n_lines_fit = FIT.fit_multi_emission_vel(data_class=data_class, id=id, two_component=False, w_dz=False)
+
+        params_1comp, (combine_lam, combine_flux, combine_sigma), slice_indices, n_lines_fit, conti_adjs = FIT.fit_multi_emission_vel(data_class=data_class, id=id, two_component=False, w_dz=False)
         lams = np.split(combine_lam, slice_indices)
         model_1comp = np.concatenate([
-            model_vel(lams[i], gaussian_parms=params_1comp['gaussian_params'][i]) for i in range(len(lams))
+            model_vel(lams[i], gaussian_parms=params_1comp['gaussian_params'][i]) + conti_adjs[i] for i in range(len(lams))
         ])
         residual_1comp = combine_flux - model_1comp
-        
-        
-        params_2comp, (combine_lam, combine_flux, combine_sigma), slice_indices, n_lines_fit = FIT.fit_multi_emission_vel(data_class=data_class, id=id, two_component=True, w_dz=False)
+
+
+        params_2comp, (combine_lam, combine_flux, combine_sigma), slice_indices, n_lines_fit, conti_adjs = FIT.fit_multi_emission_vel(data_class=data_class, id=id, two_component=True, w_dz=False)
         model_2comp = np.concatenate([
-            model_vel(lams[i], gaussian_parms=params_2comp['gaussian_params'][i]) for i in range(len(lams))
+            model_vel(lams[i], gaussian_parms=params_2comp['gaussian_params'][i]) + conti_adjs[i] for i in range(len(lams))
         ])
         residual_2comp = combine_flux - model_2comp
 
@@ -118,7 +118,8 @@ class DP:
                 # Criteria 3: 1/3 < amp_r/amp_l < 3
                 # Criteria 4: amp_r, amp_l > 3 sigma_background
                 amp_l, amp_r = params_2comp['left_amps'][i][j], params_2comp['right_amps'][i][j]
-                dp_detections.append((1/3 * amp_l < amp_r < 3 * amp_l)&(amp_r > 3 * sigmab_region[i])&(amp_l > 3 * sigmab_region[i]))
+                # dp_detections.append((1/3 * amp_l < amp_r < 3 * amp_l)&(amp_r > 3 * sigmab_region[i])&(amp_l > 3 * sigmab_region[i]))
+                dp_detections.append((amp_r > 3 * sigmab_region[i])&(amp_l > 3 * sigmab_region[i]))
 
                 lams_2compL.append(params_2comp['left_lam0s'][i][j])
                 flux_2compL.append(amp_l*np.sqrt(2*np.pi)*params_2comp['sigma_l']*params_2comp['left_lam0s'][i][j]*(1+params_2comp['dv_l']/c)/c)
