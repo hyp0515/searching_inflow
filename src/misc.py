@@ -158,7 +158,14 @@ def image_link(RA, DEC, save_image=False, fname=None, plot=False, side_arcmin=0.
     if plot and save_image:
         plt.figure(figsize=(5,5))
         plt.imshow(plt.imread(fname if fname else "cutout.jpg"))
+        pixscale = side_arcmin * 60 / 200  # arcsec/pixel
+        radius_arcsec = 1.5 / 2
+        radius_pixels = radius_arcsec / pixscale
+        circle = plt.Circle((100, 100), radius_pixels, color='magenta', fill=False, lw=1.5, linestyle='--')
+        plt.gca().add_patch(circle)
         plt.axis('off')
+        # plt.tight_layout()
+        # plt.savefig(fname if fname else "cutout.jpg")
         plt.show()
     
     return f'https://www.legacysurvey.org/viewer?ra={RA}&dec={DEC}&layer=hsc-dr3&zoom=14'

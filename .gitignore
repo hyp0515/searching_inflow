@@ -1,6 +1,7 @@
 .DS_Store
 figures/*/*.png
 figures/*/*.jpg
+figures/*/*.pdf
 figures/*.jpg
 figures/*.png
 images/*.jpg
