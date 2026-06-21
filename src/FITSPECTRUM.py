@@ -111,7 +111,11 @@ class FitSpectrum:
     
 
     def fit_multi_emission_vel(self, data_class:Spectrum, 
-                               id=None, two_component=False, w_dz=False):
+                               id=None, n_components=1, w_dz=False, two_component=None):
+        
+        # Backward compatibility: convert two_component boolean to n_components
+        if two_component is not None:
+            n_components = 2 if two_component else 1
         
         idx = data_class.id2index(id)
         df = data_class.df.iloc[idx]
@@ -122,7 +126,7 @@ class FitSpectrum:
             'OII'       : ([OII_rest[0]-40, OII_rest[1]+40], [(OII_rest[0], OII_rest[1])], 1/1.33),  # fixed ratio for [OII]3727/3729
             'Hbeta'     : ([Hbeta_rest[0]-40, Hbeta_rest[0]+40], [Hbeta_rest[0]], 0),
             'OIII'      : ([OIII_rest[0]-40, OIII_rest[1]+40], [(OIII_rest[0], OIII_rest[1])], 1/3.00),  # fixed ratio for [OIII]4959/5007
-            'Halpha'    : ([NII_rest[0]-40, NII_rest[1]+40], [(NII_rest[0], NII_rest[1]), Halpha_rest[0]], 1/3.05), # fixed ratio for [NII]
+            'Halpha'    : ([NII_rest[0]-60, NII_rest[1]+60], [(NII_rest[0], NII_rest[1]), Halpha_rest[0]], 1/3.05), # fixed ratio for [NII]
             'SII'       : ([SII_rest[0]-40, SII_rest[1]+40], [SII_rest[0], SII_rest[1]], 0)
         }
         
@@ -167,7 +171,7 @@ class FitSpectrum:
         conti_adjs = []
         for i in range(len(crop_region)):
             slice_mask = (lam >= crop_region[i][0]) & (lam <= crop_region[i][1])
-            conti_adjust_estimate_mask = ((lam >= crop_region[i][0]) & (lam <= crop_region[i][0]+10)) | ((lam <= crop_region[i][1]) & (lam >= crop_region[i][1]-10))
+            conti_adjust_estimate_mask = ((lam >= crop_region[i][0]) & (lam <= crop_region[i][0]+15)) | ((lam <= crop_region[i][1]) & (lam >= crop_region[i][1]-15))
             conti_adjust_estimate = np.median(flux[conti_adjust_estimate_mask]) if np.any(conti_adjust_estimate_mask) else 0
             lams.append(lam[slice_mask])
             fluxes.append(flux[slice_mask]-conti_adjust_estimate)
@@ -187,122 +191,84 @@ class FitSpectrum:
         combine_conti   = np.concatenate(contis)
 
         def unpack_params(params):
-            gaussian_parms = [[] for _ in range(len(crop_region))] # OII, Hbeta, OIII, Halpha, SII
-            lam0_adj = 1.0
-            if two_component:
-                if w_dz:
-                    dz, sigma_1, sigma_2, dv_r, dv_l = params[:5]
-                    amp_start_index = 5
-                    lam0_adj += dz
-                else:
-                    sigma_1, sigma_2, dv_r, dv_l = params[:4]
-                    amp_start_index = 4
-            else:
-                if w_dz:
-                    dz, sigma_1 = params[:2]
-                    amp_start_index = 2
-                    lam0_adj += dz
-                else:
-                    sigma_1 = params[0]
-                    amp_start_index = 1
-                    
+            """
+            Unpack parameters for adaptive number of velocity components.
+            
+            Parameters are organized as:
+            [optional dz], [sigma_1, ..., sigma_n], [dv_1, ..., dv_n], [amp_1, ..., amp_m]
+            where n = n_components and m = n_lines_fit * n_components for doublets, else n_lines_fit
+            """
             gaussian_parms = [[] for _ in range(len(crop_region))]
             amps = [[] for _ in range(len(crop_region))]
             lam0s = [[] for _ in range(len(crop_region))]
+            lam0_adj = 1.0
+            
+            # Parse fixed parameters
+            param_idx = 0
+            dz = 0
+            if w_dz:
+                dz = params[param_idx]
+                param_idx += 1
+                lam0_adj += dz
+            
+            # Extract sigma values for each component
+            sigmas = []
+            for comp_idx in range(n_components):
+                sigmas.append(params[param_idx])
+                param_idx += 1
+            
+            # Extract velocity shifts for each component (if n_components > 1)
+            dvs = []
+            if n_components > 1:
+                for comp_idx in range(n_components):
+                    dvs.append(params[param_idx])
+                    param_idx += 1
+            else:
+                dvs = [0]  # Single component has no velocity shift
+            
+            amp_start_index = param_idx
+            
+            # Build Gaussian parameters for each line region
             for idx_lines, lines in enumerate(lines_to_fit):
                 for idx_line, line in enumerate(lines):
-                    if not isinstance(line, tuple): # not doublet
-                        if two_component:
-                            # right component
-                            
-                            amp_r   = params[idx_line+nline_start_indices[idx_lines]+amp_start_index]
-                            lam0_r  = line * lam0_adj
-                            sigma_r_res     = c * 0.8/(lam0_r*(1+z))
-                            sigma_r_v       = sigma_1
-                            sigma_r_combine = np.sqrt(sigma_r_v**2 + sigma_r_res**2)
-                            gaussian_parms[idx_lines].insert(0, (amp_r, lam0_r, dv_r, sigma_r_combine))
-                            amps[idx_lines].insert(0, amp_r)
-                            lam0s[idx_lines].insert(0, lam0_r)
-
-                            # left component
-                            
-                            amp_l   = params[idx_line+nline_start_indices[idx_lines]+n_lines_fit+amp_start_index]
-                            lam0_l  = line * lam0_adj
-                            sigma_l_res     = c * 0.8/(lam0_l*(1+z))
-                            sigma_l_v       = sigma_2
-                            sigma_l_combine = np.sqrt(sigma_l_v**2 + sigma_l_res**2)
-                            gaussian_parms[idx_lines].append((amp_l, lam0_l, dv_l, sigma_l_combine))
-                            amps[idx_lines].append(amp_l)
-                            lam0s[idx_lines].append(lam0_l)
-                        else:
-                            amp   = params[idx_line+nline_start_indices[idx_lines]+amp_start_index]
-                            lam0  = line * lam0_adj
-                            sigma_res       = c * 0.8/(lam0*(1+z))
-                            sigma_v         = sigma_1
-                            sigma_combine   = np.sqrt(sigma_v**2 + sigma_res**2)
-                            gaussian_parms[idx_lines].insert(0, (amp, lam0, 0, sigma_combine))
-                            amps[idx_lines].insert(0, amp)
-                            lam0s[idx_lines].insert(0, lam0)
-                    else: # doublet
+                    if not isinstance(line, tuple):  # singlet
+                        for comp_idx in range(n_components):
+                            amp_idx = idx_line + nline_start_indices[idx_lines] + comp_idx * n_lines_fit + amp_start_index
+                            amp = params[amp_idx]
+                            lam0 = line * lam0_adj
+                            sigma_res = c * 0.8 / (lam0 * (1 + z))
+                            sigma_v = sigmas[comp_idx]
+                            sigma_combine = np.sqrt(sigma_v**2 + sigma_res**2)
+                            dv = dvs[comp_idx]
+                            gaussian_parms[idx_lines].append((amp, lam0, dv, sigma_combine))
+                            amps[idx_lines].append(amp)
+                            lam0s[idx_lines].append(lam0)
+                    else:  # doublet
                         line1, line2 = line
                         line_ratio = line_ratios[idx_lines]
-                            
-                        if two_component:
-                            
-                            amp_1_r     = line_ratio * params[idx_line+nline_start_indices[idx_lines]+amp_start_index]
-                            lam0_1_r    = line1 * lam0_adj
-                            sigma_1_r_res     = c * 0.8/(lam0_1_r*(1+z))
-                            sigma_1_r_v       = sigma_1
-                            sigma_1_r_combine = np.sqrt(sigma_1_r_v**2 + sigma_1_r_res**2)
-                            gaussian_parms[idx_lines].insert(0, (amp_1_r, lam0_1_r, dv_r, sigma_1_r_combine))
-                            amps[idx_lines].insert(0, amp_1_r)
-                            lam0s[idx_lines].insert(0, lam0_1_r)
-
-                            amp_2_r     = params[idx_line+nline_start_indices[idx_lines]+amp_start_index]
-                            lam0_2_r    = line2 * lam0_adj
-                            sigma_2_r_res     = c * 0.8/(lam0_2_r*(1+z))
-                            sigma_2_r_v       = sigma_1
-                            sigma_2_r_combine = np.sqrt(sigma_2_r_v**2 + sigma_2_r_res**2)
-                            gaussian_parms[idx_lines].insert(0, (amp_2_r, lam0_2_r, dv_r, sigma_2_r_combine))
-                            amps[idx_lines].insert(0, amp_2_r)
-                            lam0s[idx_lines].insert(0, lam0_2_r)
-
-                            
-                            amp_1_l     = line_ratio * params[idx_line+nline_start_indices[idx_lines]+n_lines_fit+amp_start_index]
-                            lam0_1_l    = line1 * lam0_adj
-                            sigma_1_l_res     = c * 0.8/(lam0_1_l*(1+z))
-                            sigma_1_l_v       = sigma_2
-                            sigma_1_l_combine = np.sqrt(sigma_1_l_v**2 + sigma_1_l_res**2)
-                            gaussian_parms[idx_lines].append((amp_1_l, lam0_1_l, dv_l, sigma_1_l_combine))
-                            amps[idx_lines].append(amp_1_l)
-                            lam0s[idx_lines].append(lam0_1_l)
-
-                            amp_2_l     = params[idx_line+nline_start_indices[idx_lines]+n_lines_fit+amp_start_index]
-                            lam0_2_l    = line2 * lam0_adj
-                            sigma_2_l_res     = c * 0.8/(lam0_2_l*(1+z))
-                            sigma_2_l_v       = sigma_2
-                            sigma_2_l_combine = np.sqrt(sigma_2_l_v**2 + sigma_2_l_res**2)
-                            gaussian_parms[idx_lines].append((amp_2_l, lam0_2_l, dv_l, sigma_2_l_combine))
-                            amps[idx_lines].append(amp_2_l)
-                            lam0s[idx_lines].append(lam0_2_l)
-                        else:
-                            amp_1       = line_ratio * params[idx_line+nline_start_indices[idx_lines]+amp_start_index]
-                            lam0_1      = line1 * lam0_adj
-                            sigma_1_res     = c * 0.8/(lam0_1*(1+z))
-                            sigma_1_v       = sigma_1
+                        for comp_idx in range(n_components):
+                            amp_idx = idx_line + nline_start_indices[idx_lines] + comp_idx * n_lines_fit + amp_start_index
+                            # First line of doublet (scaled by ratio)
+                            amp_1 = line_ratio * params[amp_idx]
+                            lam0_1 = line1 * lam0_adj
+                            sigma_1_res = c * 0.8 / (lam0_1 * (1 + z))
+                            sigma_1_v = sigmas[comp_idx]
                             sigma_1_combine = np.sqrt(sigma_1_v**2 + sigma_1_res**2)
-                            gaussian_parms[idx_lines].insert(0, (amp_1, lam0_1, 0, sigma_1_combine))
-                            amps[idx_lines].insert(0, amp_1)
-                            lam0s[idx_lines].insert(0, lam0_1)
-
-                            amp_2       = params[idx_line+nline_start_indices[idx_lines]+amp_start_index]
-                            lam0_2      = line2 * lam0_adj
-                            sigma_2_v       = sigma_1
-                            sigma_2_res     = c * 0.8/(lam0_2*(1+z))
+                            dv = dvs[comp_idx]
+                            gaussian_parms[idx_lines].append((amp_1, lam0_1, dv, sigma_1_combine))
+                            amps[idx_lines].append(amp_1)
+                            lam0s[idx_lines].append(lam0_1)
+                            
+                            # Second line of doublet
+                            amp_2 = params[amp_idx]
+                            lam0_2 = line2 * lam0_adj
+                            sigma_2_res = c * 0.8 / (lam0_2 * (1 + z))
+                            sigma_2_v = sigmas[comp_idx]
                             sigma_2_combine = np.sqrt(sigma_2_v**2 + sigma_2_res**2)
-                            gaussian_parms[idx_lines].insert(0, (amp_2, lam0_2, 0, sigma_2_combine))
-                            amps[idx_lines].insert(0, amp_2)
-                            lam0s[idx_lines].insert(0, lam0_2)
+                            gaussian_parms[idx_lines].append((amp_2, lam0_2, dv, sigma_2_combine))
+                            amps[idx_lines].append(amp_2)
+                            lam0s[idx_lines].append(lam0_2)
+            
             return gaussian_parms, amps, lam0s
 
         def fitting_func(lam_grid, *params):
@@ -316,74 +282,148 @@ class FitSpectrum:
         
 
         dz_init, dz_upper, dz_lower                     = 0, 1e-3, -1e-3
-        sigma_1_init, sigma_1_upper, sigma_1_lower      = 30, 800, 0.001
-        amp_init, amp_upper, amp_lower                  = [np.max(combine_flux+combine_conti)/2]*n_lines_fit, [np.max(combine_flux+combine_conti)]*n_lines_fit, [0]*n_lines_fit
-        if two_component:
-            sigma_2_init, sigma_2_upper, sigma_2_lower  = sigma_1_init, sigma_1_upper, sigma_1_lower
-            dv_r_init, dv_r_upper, dv_r_lower           =  5, 800,    0     # right component
-            dv_l_init, dv_l_upper, dv_l_lower           = -5,   0, -800     # left component
-            amp_init, amp_upper, amp_lower              = [np.max(combine_flux+combine_conti)/2]*int(n_lines_fit*2), [np.max(combine_flux+combine_conti)]*int(n_lines_fit*2), [0]*int(n_lines_fit*2)
-
-        if two_component:
-            if w_dz:
-                p0 = [dz_init, sigma_1_init, sigma_2_init, dv_r_init, dv_l_init] + amp_init
-                bounds_lower = [dz_lower, sigma_1_lower, sigma_2_lower, dv_r_lower, dv_l_lower] + amp_lower
-                bounds_upper = [dz_upper, sigma_1_upper, sigma_2_upper, dv_r_upper, dv_l_upper] + amp_upper
-            else:
-                p0 = [sigma_1_init, sigma_2_init, dv_r_init, dv_l_init] + amp_init
-                bounds_lower = [sigma_1_lower, sigma_2_lower, dv_r_lower, dv_l_lower] + amp_lower
-                bounds_upper = [sigma_1_upper, sigma_2_upper, dv_r_upper, dv_l_upper] + amp_upper
-
-        else:
-            if w_dz:
-                p0 = [dz_init, sigma_1_init] + amp_init
-                bounds_lower = [dz_lower, sigma_1_lower] + amp_lower
-                bounds_upper = [dz_upper, sigma_1_upper] + amp_upper
-            else:
-                p0 = [sigma_1_init] + amp_init
-                bounds_lower = [sigma_1_lower] + amp_lower
-                bounds_upper = [sigma_1_upper] + amp_upper
+        sigma_init, sigma_upper, sigma_lower            = 20, 800, 0.001
+        amp_init, amp_upper, amp_lower                  = [np.max(combine_flux+combine_conti)/2]*n_lines_fit*n_components, [np.max(combine_flux+combine_conti)]*n_lines_fit*n_components, [0]*n_lines_fit*n_components
+        
+        # Velocity shift parameters for multiple components
+        dv_inits = []
+        dv_uppers = []
+        dv_lowers = []
+        if n_components > 1:
+            # Initialize velocity shifts symmetrically around 0
+            for comp_idx in range(n_components):
+                if comp_idx < n_components // 2:
+                    # Left/blue-shifted components (negative velocities)
+                    dv_inits.append(-5)
+                    dv_lowers.append(-800)
+                    dv_uppers.append(150)
+                elif comp_idx == n_components // 2 and n_components % 2 == 1:
+                    # Middle component (if odd number)
+                    dv_inits.append(0)
+                    dv_lowers.append(-300)
+                    dv_uppers.append(300)
+                else:
+                    # Right/red-shifted components (positive velocities)
+                    dv_inits.append(5)
+                    dv_uppers.append(800)
+                    dv_lowers.append(-150)
+        
+        # Build parameter lists
+        p0_list = []
+        bounds_lower_list = []
+        bounds_upper_list = []
+        
+        if w_dz:
+            p0_list.append(dz_init)
+            bounds_lower_list.append(dz_lower)
+            bounds_upper_list.append(dz_upper)
+        
+        # Add sigma parameters for each component
+        for comp_idx in range(n_components):
+            p0_list.append(sigma_init)
+            bounds_lower_list.append(sigma_lower)
+            bounds_upper_list.append(sigma_upper)
+        
+        # Add velocity shift parameters for each component (if multiple components)
+        if n_components > 1:
+            for comp_idx in range(n_components):
+                p0_list.append(dv_inits[comp_idx])
+                bounds_lower_list.append(dv_lowers[comp_idx])
+                bounds_upper_list.append(dv_uppers[comp_idx])
+        
+        # Add amplitude parameters
+        p0_list.extend(amp_init)
+        bounds_lower_list.extend(amp_lower)
+        bounds_upper_list.extend(amp_upper)
+        
+        p0 = p0_list
+        bounds_lower = bounds_lower_list
+        bounds_upper = bounds_upper_list
 
         popt, pcov = curve_fit(fitting_func, combine_lam, combine_flux, p0=p0, sigma=combine_sigma, bounds=(bounds_lower, bounds_upper), absolute_sigma=True)
         # print(popt)
         params = {}
-        if two_component:
-            if w_dz:
-                dz, sigma_1, sigma_2, dv_r, dv_l = popt[:5]
-                params['dz'] = dz
-            else:
-                sigma_1, sigma_2, dv_r, dv_l = popt[:4]
-                params['dz'] = 0
-            params['sigma'] = (sigma_1, sigma_2)
-            params['dv'] = (dv_r, dv_l)
-            params['sigma_r'] = sigma_1
-            params['sigma_l'] = sigma_2
-            params['dv_r'] = dv_r
-            params['dv_l'] = dv_l
+        
+        # Parse fitted parameters
+        param_idx = 0
+        if w_dz:
+            params['dz'] = popt[param_idx]
+            param_idx += 1
         else:
-            if w_dz:
-                dz, sigma_1 = popt[:2]
-                params['dz'] = dz
-                params['sigma'] = sigma_1
-                params['dv'] = None
-            else:
-                sigma_1 = popt[0]
-                params['dz'] = 0
-                params['sigma'] = sigma_1
-                params['dv'] = None
-
+            params['dz'] = 0
+        
+        # Extract sigma values for each component
+        sigmas_fit = []
+        for comp_idx in range(n_components):
+            sigmas_fit.append(popt[param_idx])
+            param_idx += 1
+        
+        # Extract velocity shifts for each component
+        dvs_fit = []
+        if n_components > 1:
+            for comp_idx in range(n_components):
+                dvs_fit.append(popt[param_idx])
+                param_idx += 1
+        else:
+            dvs_fit = [0]
+        
+        # Store sigma and velocity parameters
+        if n_components == 1:
+            params['sigma'] = sigmas_fit[0]
+            params['dv'] = None
+        else:
+            params['sigma'] = tuple(sigmas_fit)
+            params['dv'] = tuple(dvs_fit)
+            # Also store individual component parameters for backward compatibility
+            for comp_idx, (sigma, dv) in enumerate(zip(sigmas_fit, dvs_fit)):
+                params[f'sigma_{comp_idx}'] = sigma
+                params[f'dv_{comp_idx}'] = dv
+        
+        params['n_components'] = n_components
         gaussian_parms, amps, lam0s = unpack_params(popt)
         params['gaussian_params'] = gaussian_parms
         params['amps'] = amps
         params['lam0s'] = lam0s
         
-        if two_component:
-            def split_components(data_list):
-                right = [region[:n_lines_total_region[i]][::-1] for i, region in enumerate(data_list)]
-                left = [region[n_lines_total_region[i]:] for i, region in enumerate(data_list)]
-                return left, right
-
-            params['left_comp'],   params['right_comp'] = split_components(gaussian_parms)
-            params['left_amps'],   params['right_amps'] = split_components(amps)
-            params['left_lam0s'], params['right_lam0s'] = split_components(lam0s)
-        return params, (combine_lam, combine_flux, combine_sigma), slice_indices, n_lines_fit, conti_adjs
+        # If multiple components, organize them into component groups
+        if n_components > 1:
+            # Split components by matching velocity shift (dv)
+            # Each Gaussian in gaussian_parms contains (amp, lam0, dv, sigma)
+            # We group by the dv value to identify which component each belongs to
+            component_list = []
+            for comp_idx in range(n_components):
+                target_dv = dvs_fit[comp_idx]  # The velocity shift that identifies this component
+                comp_dict = {
+                    'index': comp_idx,
+                    'sigma': sigmas_fit[comp_idx],
+                    'dv': dvs_fit[comp_idx],
+                    'gaussian_params': [],
+                    'amps': [],
+                    'lam0s': []
+                }
+                
+                # Gather parameters for this component across all line regions
+                for line_region_idx in range(len(gaussian_parms)):
+                    region_gaussian_parms = []
+                    region_amps = []
+                    region_lam0s = []
+                    
+                    # Extract only Gaussians that belong to this component (matching dv)
+                    for param_idx in range(len(gaussian_parms[line_region_idx])):
+                        gaussian_param = gaussian_parms[line_region_idx][param_idx]
+                        # gaussian_param = (amp, lam0, dv, sigma)
+                        param_dv = gaussian_param[2]  # Extract dv from the tuple
+                        
+                        # Check if this Gaussian belongs to this component
+                        if param_dv == target_dv:
+                            region_gaussian_parms.append(gaussian_param)
+                            region_amps.append(amps[line_region_idx][param_idx])
+                            region_lam0s.append(lam0s[line_region_idx][param_idx])
+                    
+                    comp_dict['gaussian_params'].append(region_gaussian_parms)
+                    comp_dict['amps'].append(region_amps)
+                    comp_dict['lam0s'].append(region_lam0s)
+                component_list.append(comp_dict)
+            params['components'] = component_list
+        combine_model = fitting_func(combine_lam, *popt)
+        return params, (combine_lam, combine_flux, combine_sigma, combine_model), slice_indices, n_lines_fit, conti_adjs
