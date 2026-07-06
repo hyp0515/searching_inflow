@@ -300,8 +300,8 @@ class FitSpectrum:
                 elif comp_idx == n_components // 2 and n_components % 2 == 1:
                     # Middle component (if odd number)
                     dv_inits.append(0)
-                    dv_lowers.append(-300)
-                    dv_uppers.append(300)
+                    dv_lowers.append(-400)
+                    dv_uppers.append(400)
                 else:
                     # Right/red-shifted components (positive velocities)
                     dv_inits.append(5)
@@ -343,46 +343,60 @@ class FitSpectrum:
         popt, pcov = curve_fit(fitting_func, combine_lam, combine_flux, p0=p0, sigma=combine_sigma, bounds=(bounds_lower, bounds_upper), absolute_sigma=True)
         # print(popt)
         params = {}
-        
         # Parse fitted parameters
         param_idx = 0
         if w_dz:
             params['dz'] = popt[param_idx]
+            params['dz_err'] = np.sqrt(pcov[param_idx, param_idx])
             param_idx += 1
         else:
-            params['dz'] = 0
-        
+            params['dz'] = [0]
+            params['dz_err'] = [0]
+
         # Extract sigma values for each component
         sigmas_fit = []
+        sigma_errors = []
         for comp_idx in range(n_components):
             sigmas_fit.append(popt[param_idx])
+            sigma_errors.append(np.sqrt(pcov[param_idx, param_idx]))
             param_idx += 1
         
         # Extract velocity shifts for each component
         dvs_fit = []
+        dv_errors = []
         if n_components > 1:
             for comp_idx in range(n_components):
                 dvs_fit.append(popt[param_idx])
+                dv_errors.append(np.sqrt(pcov[param_idx, param_idx]))
                 param_idx += 1
         else:
             dvs_fit = [0]
-        
+            dv_errors = [0]
+
         # Store sigma and velocity parameters
         if n_components == 1:
             params['sigma'] = sigmas_fit[0]
-            params['dv'] = None
+            params['sigma_err'] = sigma_errors[0]
+            params['dv'] = (0)
+            params['dv_err'] = (0)
         else:
             params['sigma'] = tuple(sigmas_fit)
+            params['sigma_err'] = tuple(sigma_errors)
             params['dv'] = tuple(dvs_fit)
+            params['dv_err'] = tuple(dv_errors)
             # Also store individual component parameters for backward compatibility
-            for comp_idx, (sigma, dv) in enumerate(zip(sigmas_fit, dvs_fit)):
-                params[f'sigma_{comp_idx}'] = sigma
-                params[f'dv_{comp_idx}'] = dv
-        
+            # for comp_idx, (sigma, sigma_err, dv, dv_err) in enumerate(zip(sigmas_fit, sigma_errors, dvs_fit, dv_errors)):
+            #     params[f'sigma_{comp_idx}'] = sigma
+            #     params[f'sigma_err_{comp_idx}'] = sigma_err
+            #     params[f'dv_{comp_idx}'] = dv
+            #     params[f'dv_err_{comp_idx}'] = dv_err
+
         params['n_components'] = n_components
         gaussian_parms, amps, lam0s = unpack_params(popt)
+        _, amps_error, _ = unpack_params(np.sqrt(np.diag(pcov)))
         params['gaussian_params'] = gaussian_parms
         params['amps'] = amps
+        params['amps_err'] = amps_error
         params['lam0s'] = lam0s
         
         # If multiple components, organize them into component groups
@@ -396,9 +410,11 @@ class FitSpectrum:
                 comp_dict = {
                     'index': comp_idx,
                     'sigma': sigmas_fit[comp_idx],
+                    'sigma_err': sigma_errors[comp_idx],
                     'dv': dvs_fit[comp_idx],
                     'gaussian_params': [],
                     'amps': [],
+                    'amps_err': [],
                     'lam0s': []
                 }
                 
@@ -406,6 +422,7 @@ class FitSpectrum:
                 for line_region_idx in range(len(gaussian_parms)):
                     region_gaussian_parms = []
                     region_amps = []
+                    region_amps_err = []
                     region_lam0s = []
                     
                     # Extract only Gaussians that belong to this component (matching dv)
@@ -418,10 +435,12 @@ class FitSpectrum:
                         if param_dv == target_dv:
                             region_gaussian_parms.append(gaussian_param)
                             region_amps.append(amps[line_region_idx][param_idx])
+                            region_amps_err.append(amps_error[line_region_idx][param_idx])
                             region_lam0s.append(lam0s[line_region_idx][param_idx])
                     
                     comp_dict['gaussian_params'].append(region_gaussian_parms)
                     comp_dict['amps'].append(region_amps)
+                    comp_dict['amps_err'].append(region_amps_err)
                     comp_dict['lam0s'].append(region_lam0s)
                 component_list.append(comp_dict)
             params['components'] = component_list

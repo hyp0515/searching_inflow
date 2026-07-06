@@ -4,7 +4,7 @@ import astropy.constants as const
 from scipy.ndimage import gaussian_filter1d
 import requests
 from astropy.io import fits
-
+from astropy.cosmology import Planck18 as cosmo
 
 c = const.c.cgs.value * 1e-5  # speed of light in km/s
 desi_wavelength = np.arange(3600, 9824 + .8, .8) # DESI's observe wavelength
@@ -143,6 +143,30 @@ def model_vel(lam, gaussian_parms=None, conti_parms=(0, 0)):
     conti = conti_a * lam + conti_b
 
     return flux + conti
+
+def flux(amp, sigma_v, lam0, dv=None):
+    if dv is None:
+        return amp * np.sqrt(2 * np.pi) * (sigma_v * lam0 / c)
+    else:
+        return amp * np.sqrt(2 * np.pi) * (sigma_v * lam0 / c) * (1 + dv/c)
+
+def lum(flux, z):
+    luminous_distance = cosmo.luminosity_distance(z).to('cm').value
+    return 4 * np.pi * (luminous_distance**2) * flux
+
+def reddening(flux_halpha, flux_hbeta):
+    ebv = 1.97 * np.log10((flux_halpha/flux_hbeta) / 2.86)
+    A_halpha = 3.33 * ebv
+    return A_halpha
+
+def sfr(flux_halpha, flux_hbeta, z):
+    A_halpha = reddening(flux_halpha, flux_hbeta)
+    flux_intrinsic = flux_halpha / (10**(A_halpha/-2.5)) * 1e-17
+    flux_adjusted = flux_intrinsic * (1+z)
+    
+    lum_halpha = lum(flux_adjusted, z)
+    sfr = 5.5e-42 * lum_halpha
+    return sfr
 
 def image_link(RA, DEC, save_image=False, fname=None, plot=False, side_arcmin=0.5):
     if save_image:
