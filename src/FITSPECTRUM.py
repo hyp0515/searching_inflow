@@ -282,7 +282,7 @@ class FitSpectrum:
         
 
         dz_init, dz_upper, dz_lower                     = 0, 1e-3, -1e-3
-        sigma_init, sigma_upper, sigma_lower            = 20, 800, 0.001
+        sigma_init, sigma_upper, sigma_lower            = 50, 700, 10
         amp_init, amp_upper, amp_lower                  = [np.max(combine_flux+combine_conti)/2]*n_lines_fit*n_components, [np.max(combine_flux+combine_conti)]*n_lines_fit*n_components, [0]*n_lines_fit*n_components
         
         # Velocity shift parameters for multiple components
@@ -296,7 +296,7 @@ class FitSpectrum:
                     # Left/blue-shifted components (negative velocities)
                     dv_inits.append(-5)
                     dv_lowers.append(-800)
-                    dv_uppers.append(150)
+                    dv_uppers.append(200)
                 elif comp_idx == n_components // 2 and n_components % 2 == 1:
                     # Middle component (if odd number)
                     dv_inits.append(0)
@@ -306,7 +306,7 @@ class FitSpectrum:
                     # Right/red-shifted components (positive velocities)
                     dv_inits.append(5)
                     dv_uppers.append(800)
-                    dv_lowers.append(-150)
+                    dv_lowers.append(-200)
         
         # Build parameter lists
         p0_list = []

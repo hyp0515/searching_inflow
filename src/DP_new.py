@@ -36,6 +36,32 @@ REGION_OF_LINE = [0, 0, 1, 2, 2, 3, 3, 3, 4, 4]
 N_MODELS = 4          # try N = 1..4 components
 PARAMS_PER_COMP = 9   # used only for the BIC penalty (matches your DP_new stub)
 
+# --- model-selection thresholds -------------------------------------------
+# A model is "decisively" preferred over another when their BIC differs by
+# more than this. Below it, the two models are statistically indistinguishable
+# and we let component-level SNR break the tie (see fit_dp).
+DELTA_BIC_DECISIVE = 15.0
+# A more-complex candidate model only "qualifies" over a simpler one if
+# EVERY one of its components is jointly detected above SNR_SIG_THRESHOLD on
+# at least one of these anchor lines (all components on OIII5007, OR all
+# components on Halpha -- not a mix of different lines per component).
+QUALIFY_ANCHOR_LINES = ['OIII5007', 'Halpha', 'NII6583']
+SNR_SIG_THRESHOLD = 3.0
+# FITSPECTRUM fits velocity sigma with hard bounds of 1-800 km/s (see
+# sigma_lower / sigma_upper in FITSPECTRUM.fit_multi_emission_vel). A
+# component whose fitted sigma is pinned at/near either bound is a sign the
+# optimizer collapsed it against a fit limit rather than resolving a real
+# component.
+SIGMA_FLOOR = 10.0
+SIGMA_FLOOR_ATOL = 0.001
+SIGMA_CEIL = 699.0
+# SIGMA_CEIL_ATOL = 0.001
+# A model with too many broad (likely blended/degenerate) components is also
+# rejected: more than MAX_WIDE_COMPONENTS components wider than
+# WIDE_SIGMA_THRESHOLD km/s.
+WIDE_SIGMA_THRESHOLD = 250.0
+MAX_WIDE_COMPONENTS = 1
+
 
 class DP:
     def __init__(self):
@@ -106,6 +132,105 @@ class DP:
         out.sort(key=lambda d: d['comp_dv'])
         return out
 
+    @staticmethod
+    def _per_region_noise(csigma, slice_idx):
+        """RMS background noise in each fit region, from the per-pixel sigma."""
+        noise_region = np.split(csigma, slice_idx)
+        return [np.sqrt(np.mean(seg ** 2)) if seg.size > 1 else np.inf
+                for seg in noise_region]
+
+    def _component_sig_flags(self, params, sigmab_region):
+        """
+        For a given N-component fit, return a list (one entry per component,
+        bluest first) of length-len(LINE_NAMES) boolean lists flagging which
+        lines are individually detected above SNR_SIG_THRESHOLD.
+        Used both by _model_qualifies (to decide whether a model "qualifies")
+        and to later drop components with zero True entries.
+        """
+        comps = self._iter_components(params)
+        flags = []
+        for comp in comps:
+            comp_flags = []
+            for li in range(len(LINE_NAMES)):
+                amp = comp['gp_flat'][li][0]
+                sig_b = sigmab_region[REGION_OF_LINE[li]]
+                comp_flags.append(bool(np.isfinite(sig_b) and amp > SNR_SIG_THRESHOLD * sig_b))
+            flags.append(comp_flags)
+        return flags
+
+    def _component_sigmas(self, params):
+        """Per-component velocity sigma (km/s), bluest first -- same order as _component_sig_flags."""
+        return [comp['comp_sigma'] for comp in self._iter_components(params)]
+
+    @staticmethod
+    def _model_qualifies(flags):
+        """
+        `flags`: list of per-component boolean lists (len(LINE_NAMES)), from
+        _component_sig_flags. The candidate model qualifies only if EVERY
+        one of its components is significant (>3 SNR) on the same anchor
+        line -- i.e. all components clear OIII5007, or all components clear
+        Halpha (not a mix of different lines per component).
+        """
+        if not flags:
+            return False
+        anchor_idx = [LINE_NAMES.index(name) for name in QUALIFY_ANCHOR_LINES]
+        return any(all(comp_flags[li] for comp_flags in flags) for li in anchor_idx)
+
+    def _choose_n_components(self, bic_by_n, sig_flags_by_n, comp_sigmas_by_n):
+        """
+        Model selection, repeated against a shrinking candidate pool:
+          1. n_min = argmin(BIC) among remaining candidates. If every other
+             candidate's BIC is more than DELTA_BIC_DECISIVE worse, tentatively
+             accept n_min.
+          2. Otherwise, among n_min and its "competitive" alternatives
+             (deltaBIC < DELTA_BIC_DECISIVE), prefer the one with the most
+             components that _model_qualifies (ALL of its components
+             significant on OIII5007 or ALL significant on Halpha), falling
+             back to n_min if none qualify.
+          Whatever is tentatively chosen -- even a decisive BIC winner with
+          no competitive alternatives -- is then rejected outright, dropped
+          from the pool, and re-picked from what remains if it either:
+            - does NOT _model_qualifies (fails the OIII5007/Halpha anchor
+              check above), or
+            - has ANY component whose fitted velocity sigma is pinned at/near
+              SIGMA_FLOOR or SIGMA_CEIL, or
+            - has more than MAX_WIDE_COMPONENTS components wider than
+              WIDE_SIGMA_THRESHOLD.
+          This can cascade all the way down to n=1: N=1 is the floor of the
+          model space (there's nothing simpler to fall back to), so it is
+          always accepted once reached, regardless of these checks.
+        """
+        def has_pinned_sigma(sigmas):
+            return sigmas and any((s < SIGMA_FLOOR + SIGMA_FLOOR_ATOL) or (s > SIGMA_CEIL) for s in sigmas)
+
+        def too_many_wide(sigmas):
+            return sigmas and sum(s > WIDE_SIGMA_THRESHOLD for s in sigmas) > MAX_WIDE_COMPONENTS
+
+        candidates = {n for n in range(1, N_MODELS + 1) if np.isfinite(bic_by_n[n - 1])}
+        fallback = min(candidates, key=lambda n: bic_by_n[n - 1]) if candidates else 1
+
+        while candidates:
+            n_min = min(candidates, key=lambda n: bic_by_n[n - 1])
+            competitive = [n for n in candidates
+                           if n != n_min and (bic_by_n[n - 1] - bic_by_n[n_min - 1]) < DELTA_BIC_DECISIVE]
+
+            chosen = n_min
+            for n in sorted({n_min, *competitive}, reverse=True):
+                if self._model_qualifies(sig_flags_by_n[n - 1]):
+                    chosen = n
+                    break
+
+            sigmas_chosen = comp_sigmas_by_n[chosen - 1]
+            fails_anchor_lines = not self._model_qualifies(sig_flags_by_n[chosen - 1])
+            if chosen > 1 and (has_pinned_sigma(sigmas_chosen) or too_many_wide(sigmas_chosen)
+                               or fails_anchor_lines):
+                candidates.discard(chosen)
+                continue
+
+            return chosen
+
+        return fallback
+
     # ================================================================== #
     #  2. Fit one target, choose N, emit tidy records                    #
     # ================================================================== #
@@ -145,17 +270,31 @@ class DP:
                 bic_by_n.append(np.inf)
                 extras_by_n.append(None)
 
-        best_n = int(np.argmin(bic_by_n)) + 1
+        # --- per-component SNR flags & sigmas for every N, then pick N -------
+        sigmab_region_by_n = [None] * N_MODELS
+        sig_flags_by_n = [None] * N_MODELS
+        comp_sigmas_by_n = [None] * N_MODELS
+        for i in range(N_MODELS):
+            if params_by_n[i] is None:
+                continue
+            _, _, csigma_i, slice_idx_i = extras_by_n[i]
+            sigmab_region_by_n[i] = self._per_region_noise(csigma_i, slice_idx_i)
+            sig_flags_by_n[i] = self._component_sig_flags(params_by_n[i], sigmab_region_by_n[i])
+            comp_sigmas_by_n[i] = self._component_sigmas(params_by_n[i])
+
+        best_n = self._choose_n_components(bic_by_n, sig_flags_by_n, comp_sigmas_by_n)
+        n_fit = best_n  # number of components actually fit (before cleanup)
         best_params = params_by_n[best_n - 1]
         clam, cflux, csigma, slice_idx = extras_by_n[best_n - 1]
+        sigmab_region = sigmab_region_by_n[best_n - 1]
+        sig_flags = sig_flags_by_n[best_n - 1]
 
-        # --- per-region background noise (component-count independent) ------
-        noise_region = np.split(csigma, slice_idx)
-        sigmab_region = [np.sqrt(np.mean(seg ** 2)) if seg.size > 1 else np.inf
-                         for seg in noise_region]
+        # --- flag (but keep) components with zero significantly-detected lines ---
+        comps = self._iter_components(best_params)
+        comp_insig = [sum(flags) == 0 for flags in sig_flags]  # no line above SNR_SIG_THRESHOLD
+        best_n = len(comps)
 
         # --- build the tidy component rows ---------------------------------
-        comps = self._iter_components(best_params)
         lam_full = desi_wavelength / (1 + Z)
 
         comp_rows = []
@@ -177,7 +316,7 @@ class DP:
                 # convention of the original two-component code.
                 f_line = flux(amp, comp['comp_sigma'], lam0, dv=dv)
                 f_err = flux(amp_err, comp['comp_sigma'], lam0, dv=dv)
-                noise3 = flux(3 * sig_b, comp['comp_sigma'], lam0, dv=dv)
+                noise3 = flux(SNR_SIG_THRESHOLD * sig_b, comp['comp_sigma'], lam0, dv=dv)
 
                 line_flux_total[name] += f_line
 
@@ -193,8 +332,9 @@ class DP:
                     'FLUX':      np.float32(f_line),
                     'FLUX_ERR':  np.float32(f_err),
                     'SNR':       np.float32(amp / sig_b if np.isfinite(sig_b) else 0.0),
-                    'SIG':       bool(amp > 3 * sig_b),   # >3 sigma detection
+                    'SIG':       bool(amp > SNR_SIG_THRESHOLD * sig_b),   # detection flag
                     'NOISE3':    np.float32(noise3),
+                    'COMP_INSIG': bool(comp_insig[comp_idx]),  # whole component has no line above SNR_SIG_THRESHOLD
                 })
 
         # --- parent scalar row (N-independent quantities) ------------------
@@ -205,7 +345,8 @@ class DP:
             'Z':        np.float32(Z),
             'LOGM':     np.float32(LOGM),
             'LOGSFR':   np.float32(LOGSFR),
-            'N_COMP':   best_n,
+            'N_COMP':     best_n,
+            'N_COMP_FIT': n_fit,   # components in the chosen fit (== N_COMP; insignificant ones are flagged, not dropped)
         }
         for i in range(N_MODELS):
             parent_row[f'BIC_{i+1}'] = np.float32(bic_by_n[i])
@@ -244,16 +385,41 @@ class DP:
         Classify EACH component of EACH target on the BPT diagram.
         Returns a (TARGETID, COMP_IDX) -> class table, so a galaxy with
         3 components gets 3 classifications instead of a fixed L/R pair.
+
+        A ratio's numerator or denominator line can be individually
+        undetected (SNR < SNR_SIG_THRESHOLD) while still being included in
+        the classification, so OIII_HB_BOUND / NII_HA_BOUND flag whether
+        each BPT axis is a genuine measurement or only a limit:
+          - numerator undetected, denominator detected  -> 'upper_limit'
+          - denominator undetected, numerator detected   -> 'lower_limit'
+          - both detected                                -> 'measured'
+          - both undetected                              -> 'uncertain'
         """
         need = ['OIII5007', 'Hbeta', 'NII6583', 'Halpha']
+
+        def bound(snr, num, den):
+            num_ok = snr[num] >= SNR_SIG_THRESHOLD
+            den_ok = snr[den] >= SNR_SIG_THRESHOLD
+            if num_ok and den_ok:
+                return 'measured'
+            if den_ok:
+                return 'upper_limit'
+            if num_ok:
+                return 'lower_limit'
+            return 'uncertain'
 
         def classify(sub):
             f = sub.set_index('LINE')['FLUX']
             snr = sub.set_index('LINE')['SNR']
             if any(l not in f.index for l in need):
-                return 256  # unclassified
+                return pd.Series({'BPT': 256, 'OIII_HB_BOUND': None, 'NII_HA_BOUND': None})
+
+            oiii_hb_bound = bound(snr, 'OIII5007', 'Hbeta')
+            nii_ha_bound = bound(snr, 'NII6583', 'Halpha')
+
             if (snr[need] <= 0).sum() > 1:
-                return 256
+                return pd.Series({'BPT': 256, 'OIII_HB_BOUND': oiii_hb_bound,
+                                   'NII_HA_BOUND': nii_ha_bound})
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", category=RuntimeWarning)
                 oiii_hb = np.log10(f['OIII5007'] / f['Hbeta'])
@@ -262,15 +428,17 @@ class DP:
             comp = 0.61 / (nii_ha - 0.47) + 1.19
             liner = 1.05 * nii_ha + 0.45
             if (sf > oiii_hb or comp > oiii_hb) and (nii_ha < 0.47):
-                return 1 if (sf > oiii_hb and nii_ha < 0.05) else 4
+                bpt = 1 if (sf > oiii_hb and nii_ha < 0.05) else 4
             elif (sf < oiii_hb or comp < oiii_hb):
-                return 64 if liner > oiii_hb else 16
-            return 256
+                bpt = 64 if liner > oiii_hb else 16
+            else:
+                bpt = 256
+            return pd.Series({'BPT': bpt, 'OIII_HB_BOUND': oiii_hb_bound,
+                               'NII_HA_BOUND': nii_ha_bound})
 
         out = (dp_components
                .groupby(['TARGETID', 'COMP_IDX'])
                .apply(classify)
-               .rename('BPT')
                .reset_index())
         return out
 

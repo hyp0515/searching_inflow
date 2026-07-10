@@ -154,8 +154,8 @@ def lum(flux, z):
     luminous_distance = cosmo.luminosity_distance(z).to('cm').value
     return 4 * np.pi * (luminous_distance**2) * flux
 
-def reddening(flux_halpha, flux_hbeta):
-    ebv = 1.97 * np.log10((flux_halpha/flux_hbeta) / 2.86)
+def reddening(flux_halpha, flux_hbeta, flux_ratio=2.86):
+    ebv = 1.97 * np.log10((flux_halpha/flux_hbeta) / flux_ratio)
     A_halpha = 3.33 * ebv
     return A_halpha
 
