@@ -236,7 +236,10 @@ class FitSpectrum:
                             amp_idx = idx_line + nline_start_indices[idx_lines] + comp_idx * n_lines_fit + amp_start_index
                             amp = params[amp_idx]
                             lam0 = line * lam0_adj
-                            sigma_res = c * 0.8 / (lam0 * (1 + z))
+                            # Instrumental LSF sigma (km/s) from the DESI resolving
+                            # power. R is evaluated at the OBSERVED wavelength
+                            # lam0*(1+z); sigma_v itself is frame-invariant.
+                            sigma_res = desi_sigma_resolution_vel(lam0 * (1 + z))
                             sigma_v = sigmas[comp_idx]
                             sigma_combine = np.sqrt(sigma_v**2 + sigma_res**2)
                             dv = dvs[comp_idx]
@@ -251,7 +254,7 @@ class FitSpectrum:
                             # First line of doublet (scaled by ratio)
                             amp_1 = line_ratio * params[amp_idx]
                             lam0_1 = line1 * lam0_adj
-                            sigma_1_res = c * 0.8 / (lam0_1 * (1 + z))
+                            sigma_1_res = desi_sigma_resolution_vel(lam0_1 * (1 + z))
                             sigma_1_v = sigmas[comp_idx]
                             sigma_1_combine = np.sqrt(sigma_1_v**2 + sigma_1_res**2)
                             dv = dvs[comp_idx]
@@ -262,7 +265,7 @@ class FitSpectrum:
                             # Second line of doublet
                             amp_2 = params[amp_idx]
                             lam0_2 = line2 * lam0_adj
-                            sigma_2_res = c * 0.8 / (lam0_2 * (1 + z))
+                            sigma_2_res = desi_sigma_resolution_vel(lam0_2 * (1 + z))
                             sigma_2_v = sigmas[comp_idx]
                             sigma_2_combine = np.sqrt(sigma_2_v**2 + sigma_2_res**2)
                             gaussian_parms[idx_lines].append((amp_2, lam0_2, dv, sigma_2_combine))
@@ -282,7 +285,7 @@ class FitSpectrum:
         
 
         dz_init, dz_upper, dz_lower                     = 0, 1e-3, -1e-3
-        sigma_init, sigma_upper, sigma_lower            = 50, 700, 10
+        sigma_init, sigma_upper, sigma_lower            = 50, 700, 5
         amp_init, amp_upper, amp_lower                  = [np.max(combine_flux+combine_conti)/2]*n_lines_fit*n_components, [np.max(combine_flux+combine_conti)]*n_lines_fit*n_components, [0]*n_lines_fit*n_components
         
         # Velocity shift parameters for multiple components
@@ -294,18 +297,18 @@ class FitSpectrum:
             for comp_idx in range(n_components):
                 if comp_idx < n_components // 2:
                     # Left/blue-shifted components (negative velocities)
-                    dv_inits.append(-5)
-                    dv_lowers.append(-800)
+                    dv_inits.append(-20)
+                    dv_lowers.append(-600)
                     dv_uppers.append(200)
                 elif comp_idx == n_components // 2 and n_components % 2 == 1:
                     # Middle component (if odd number)
                     dv_inits.append(0)
-                    dv_lowers.append(-400)
-                    dv_uppers.append(400)
+                    dv_lowers.append(-300)
+                    dv_uppers.append(300)
                 else:
                     # Right/red-shifted components (positive velocities)
-                    dv_inits.append(5)
-                    dv_uppers.append(800)
+                    dv_inits.append(20)
+                    dv_uppers.append(600)
                     dv_lowers.append(-200)
         
         # Build parameter lists

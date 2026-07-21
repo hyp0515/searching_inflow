@@ -52,15 +52,90 @@ SNR_SIG_THRESHOLD = 3.0
 # component whose fitted sigma is pinned at/near either bound is a sign the
 # optimizer collapsed it against a fit limit rather than resolving a real
 # component.
-SIGMA_FLOOR = 10.0
+SIGMA_FLOOR = 5.0
 SIGMA_FLOOR_ATOL = 0.001
 SIGMA_CEIL = 699.0
 # SIGMA_CEIL_ATOL = 0.001
 # A model with too many broad (likely blended/degenerate) components is also
 # rejected: more than MAX_WIDE_COMPONENTS components wider than
 # WIDE_SIGMA_THRESHOLD km/s.
-WIDE_SIGMA_THRESHOLD = 250.0
+WIDE_SIGMA_THRESHOLD = 300.0
 MAX_WIDE_COMPONENTS = 1
+# A model is also rejected if any two of its components are practically the
+# same component (degenerate split): their sigmas within a factor of
+# SIGMA_RATIO_DEGENERATE of each other AND their dv within
+# DV_DIFF_DEGENERATE km/s.
+SIGMA_RATIO_DEGENERATE = 1.5
+DV_DIFF_DEGENERATE = 60.0
+# ...or, regardless of ratio, if both components are individually narrow
+# (sigma below this) and within DV_DIFF_DEGENERATE km/s -- two narrow lines
+# this close together aren't resolvable as distinct kinematic components.
+NARROW_SIGMA_DEGENERATE = 60.0
+# Between the 2- and 4-component models specifically: if their BIC is this
+# close, the extra complexity of N=4 isn't decisively justified, so N=2 wins
+# by Occam's razor regardless of the general qualify-based tie-break above.
+DELTA_BIC_SIMPLICITY = 5.0
+
+# --- Stage-4 kinematic (line-profile shape) classification -----------------
+# Widths used here are the DECONVOLVED velocity sigmas stored in
+# dp_components['SIGMA']. For classification we floor them at the DESI
+# resolution: a component narrower than we can resolve is treated as
+# "= resolution", so unresolved spikes (sigma pinned near SIGMA_FLOOR) cannot
+# blow up width ratios.
+CLASS_SIGMA_FLOOR = 30.0        # km/s, ~DESI resolution at these redshifts
+# A component is "broad" (turbulent outflow phase) on an ABSOLUTE width cut,
+# OR (for n>=3) on a RELATIVE cut: the single widest component counts as broad
+# when widest / second-widest exceeds SD_WIDTH_RATIO_MAX, even below the
+# absolute cut. The second-widest reference (not the narrowest) avoids the
+# unresolved-narrow blow-up and won't mislabel a moderately-wide central head.
+BROAD_SIGMA_THRESHOLD = 200.0   # km/s
+# 'SD' (symmetric double): two NON-broad components of COMPARABLE width
+# (max/min sigma below this, after flooring) that straddle the internal
+# reference velocity. Flux ratio is intentionally NOT required. EXCEPTION: a
+# pair with BOTH components in the narrow regime (sigma < WIDTH_NARROW_MAX)
+# also counts as SD regardless of this ratio.
+SD_WIDTH_RATIO_MAX = 2.0
+# ...and the SD pair must be genuinely split, so a near-central/degenerate pair
+# doesn't masquerade as a double. Measured differently by component count:
+#   n == 2  : PEAK-TO-PEAK separation |dv_j - dv_i| must exceed this (v_ref is
+#             the mean of just these two, so an unequal flux ratio would drag it
+#             onto the brighter peak and break a per-component offset test).
+#   n >= 3  : each component's own |dv - v_ref| must exceed this.
+SD_MIN_SEP = 60.0               # km/s
+# 'CEN' (central component): a non-broad component lying BETWEEN the two SD
+# (rim) components -- the central head. No distance-to-reference tolerance is
+# used (per Fred): sitting between the rotational pair is sufficient.
+# '2-pairs': components split into two velocity groups separated by more than
+# this, each group carrying an internal width contrast (a narrow + a broader
+# component) -> two outflow systems.
+TWO_SYS_MIN_SEP = 150.0         # km/s
+TWO_SYS_CONTRAST = 2.0          # within-group max/min sigma to count as a pair
+# '3-width': three mutually distinct widths -- every consecutive (sorted)
+# width ratio must exceed this.
+DISTINCT_WIDTH_RATIO = 2.0
+# 2-component, non-SD systems are split further by the narrow/wide AMPLITUDE
+# ratio, measured on the brightest line (a consistent anchor across components):
+#   r < AMP_RATIO_AMBIG                  -> 'ambiguous' (the wide component
+#                                           out-peaks the narrow one)
+#   AMP_RATIO_AMBIG <= r <= AMP_RATIO_OUTFLOW -> '2-width'
+#   r > AMP_RATIO_OUTFLOW                -> 'outflow' (sharp core + faint wing)
+AMP_RATIO_AMBIG = 1/1.5
+AMP_RATIO_OUTFLOW = 1.5
+# A symmetric double ('rotation') is split further by the peak-amplitude ratio
+# of its two components. The bands are symmetric about 1, so the result does
+# not depend on which component is the numerator:
+#   1/ROT_AMP_SYM  <= r <= ROT_AMP_SYM   -> 'rotation'
+#   1/ROT_AMP_ASYM <= r <  1/ROT_AMP_SYM  (or the mirror band) -> 'asymmetry'
+#   beyond ROT_AMP_ASYM                   -> 'ambiguous'
+ROT_AMP_SYM = 2.0
+ROT_AMP_ASYM = 4.0
+# Descriptive width census reported alongside the class: every component is
+# binned as narrow (N), medium (M) or broad (B) purely by width, so the three
+# counts always partition the components (CNT_N + CNT_M + CNT_B == N_KIN).
+# NB: independent of the is_broad flag used for classification (which also
+# carries the RELATIVE broad rule) -- CNT_B is a pure width count.
+WIDTH_NARROW_MAX = 90.0        # km/s, N: sigma < 90
+WIDTH_MEDIUM_MAX = 200.0        # km/s, M: 90 <= sigma < 200 ; B: sigma >= 200
 
 
 class DP:
@@ -162,6 +237,10 @@ class DP:
         """Per-component velocity sigma (km/s), bluest first -- same order as _component_sig_flags."""
         return [comp['comp_sigma'] for comp in self._iter_components(params)]
 
+    def _component_dvs(self, params):
+        """Per-component velocity offset (km/s), bluest first -- same order as _component_sig_flags."""
+        return [comp['comp_dv'] for comp in self._iter_components(params)]
+
     @staticmethod
     def _model_qualifies(flags):
         """
@@ -176,7 +255,7 @@ class DP:
         anchor_idx = [LINE_NAMES.index(name) for name in QUALIFY_ANCHOR_LINES]
         return any(all(comp_flags[li] for comp_flags in flags) for li in anchor_idx)
 
-    def _choose_n_components(self, bic_by_n, sig_flags_by_n, comp_sigmas_by_n):
+    def _choose_n_components(self, bic_by_n, sig_flags_by_n, comp_sigmas_by_n, comp_dvs_by_n):
         """
         Model selection, repeated against a shrinking candidate pool:
           1. n_min = argmin(BIC) among remaining candidates. If every other
@@ -187,6 +266,10 @@ class DP:
              components that _model_qualifies (ALL of its components
              significant on OIII5007 or ALL significant on Halpha), falling
              back to n_min if none qualify.
+          2b. Special case: if this lands on N=4 and N=2 is also a candidate,
+              but their BIC differ by less than DELTA_BIC_SIMPLICITY, N=4's
+              extra complexity isn't decisively justified over N=2 even
+              though it "qualified" above -- fall back to N=2 outright.
           Whatever is tentatively chosen -- even a decisive BIC winner with
           no competitive alternatives -- is then rejected outright, dropped
           from the pool, and re-picked from what remains if it either:
@@ -195,7 +278,15 @@ class DP:
             - has ANY component whose fitted velocity sigma is pinned at/near
               SIGMA_FLOOR or SIGMA_CEIL, or
             - has more than MAX_WIDE_COMPONENTS components wider than
-              WIDE_SIGMA_THRESHOLD.
+              WIDE_SIGMA_THRESHOLD, or
+            - has any two components that are practically the same component
+              -- |dv difference| < DV_DIFF_DEGENERATE km/s AND EITHER their
+              sigma ratio < SIGMA_RATIO_DEGENERATE OR both are individually
+              narrower than NARROW_SIGMA_DEGENERATE (two narrow lines that
+              close together aren't resolvable regardless of their ratio) --
+              a sign the fit split one real component into two near-identical
+              ones rather than resolving
+              two genuinely distinct components.
           This can cascade all the way down to n=1: N=1 is the floor of the
           model space (there's nothing simpler to fall back to), so it is
           always accepted once reached, regardless of these checks.
@@ -205,6 +296,18 @@ class DP:
 
         def too_many_wide(sigmas):
             return sigmas and sum(s > WIDE_SIGMA_THRESHOLD for s in sigmas) > MAX_WIDE_COMPONENTS
+
+        def has_degenerate_pair(sigmas, dvs):
+            for i in range(len(sigmas)):
+                for j in range(i + 1, len(sigmas)):
+                    if abs(dvs[i] - dvs[j]) >= DV_DIFF_DEGENERATE:
+                        continue
+                    if sigmas[i] < NARROW_SIGMA_DEGENERATE and sigmas[j] < NARROW_SIGMA_DEGENERATE:
+                        return True
+                    lo, hi = sorted((sigmas[i], sigmas[j]))
+                    if lo > 0 and (hi / lo) < SIGMA_RATIO_DEGENERATE:
+                        return True
+            return False
 
         candidates = {n for n in range(1, N_MODELS + 1) if np.isfinite(bic_by_n[n - 1])}
         fallback = min(candidates, key=lambda n: bic_by_n[n - 1]) if candidates else 1
@@ -220,10 +323,16 @@ class DP:
                     chosen = n
                     break
 
+            # 2 vs 4 specifically: BIC too close to justify the extra
+            # complexity -> prefer the simpler 2-component model outright.
+            if chosen == 4 and 2 in candidates and abs(bic_by_n[3] - bic_by_n[1]) < DELTA_BIC_SIMPLICITY:
+                chosen = 2
+
             sigmas_chosen = comp_sigmas_by_n[chosen - 1]
+            dvs_chosen = comp_dvs_by_n[chosen - 1]
             fails_anchor_lines = not self._model_qualifies(sig_flags_by_n[chosen - 1])
             if chosen > 1 and (has_pinned_sigma(sigmas_chosen) or too_many_wide(sigmas_chosen)
-                               or fails_anchor_lines):
+                               or fails_anchor_lines or has_degenerate_pair(sigmas_chosen, dvs_chosen)):
                 candidates.discard(chosen)
                 continue
 
@@ -274,6 +383,7 @@ class DP:
         sigmab_region_by_n = [None] * N_MODELS
         sig_flags_by_n = [None] * N_MODELS
         comp_sigmas_by_n = [None] * N_MODELS
+        comp_dvs_by_n = [None] * N_MODELS
         for i in range(N_MODELS):
             if params_by_n[i] is None:
                 continue
@@ -281,8 +391,9 @@ class DP:
             sigmab_region_by_n[i] = self._per_region_noise(csigma_i, slice_idx_i)
             sig_flags_by_n[i] = self._component_sig_flags(params_by_n[i], sigmab_region_by_n[i])
             comp_sigmas_by_n[i] = self._component_sigmas(params_by_n[i])
+            comp_dvs_by_n[i] = self._component_dvs(params_by_n[i])
 
-        best_n = self._choose_n_components(bic_by_n, sig_flags_by_n, comp_sigmas_by_n)
+        best_n = self._choose_n_components(bic_by_n, sig_flags_by_n, comp_sigmas_by_n, comp_dvs_by_n)
         n_fit = best_n  # number of components actually fit (before cleanup)
         best_params = params_by_n[best_n - 1]
         clam, cflux, csigma, slice_idx = extras_by_n[best_n - 1]
@@ -439,6 +550,365 @@ class DP:
         out = (dp_components
                .groupby(['TARGETID', 'COMP_IDX'])
                .apply(classify)
+               .reset_index())
+        return out
+
+    # ================================================================== #
+    #  4b. Stage-4 kinematic classification (line-profile shape)         #
+    # ================================================================== #
+    #
+    # Design (matches the workflow):
+    #   * SYSTEMIC-INDEPENDENT. Uses only relative velocities (via an internal
+    #     flux-weighted reference V_REF), component widths, and an ABSOLUTE
+    #     broad-width cut -- never the (possibly biased) pipeline redshift Z,
+    #     and never a width ratio for the broad test.
+    #   * 'SD' is gated on the width ratio only (comparable widths, straddling
+    #     the reference); flux ratio is NOT required.
+    #   * Widths are the deconvolved velocity sigmas, floored at the
+    #     resolution so unresolved spikes can't drive the ratios.
+    # Interpretation that needs a true systemic (blueshift, centring) is a
+    # separate, later step -- not done here.
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _distinct_widths(sig_sorted, ratio=DISTINCT_WIDTH_RATIO):
+        """True if the (>=3) components have mutually distinct widths, i.e.
+        every consecutive sorted width ratio exceeds `ratio` (stratified)."""
+        s = np.sort(np.asarray(sig_sorted, float))
+        if len(s) < 3 or np.any(s <= 0):
+            return False
+        return bool(np.all((s[1:] / s[:-1]) > ratio))
+
+    @staticmethod
+    def _is_two_systems(dv, sig_f):
+        """Split components at their largest velocity gap; True if that yields
+        two groups of >=2 separated by > TWO_SYS_MIN_SEP, each with an internal
+        width contrast (a narrow + a broader component) -> two outflow systems.
+        """
+        dv = np.asarray(dv, float)
+        sig_f = np.asarray(sig_f, float)
+        if len(dv) < 4:
+            return False
+        order = np.argsort(dv)
+        dv, sig_f = dv[order], sig_f[order]
+        gaps = np.diff(dv)
+        k = int(np.argmax(gaps))                     # split after index k
+        if gaps[k] < TWO_SYS_MIN_SEP:
+            return False
+        g1, g2 = sig_f[:k + 1], sig_f[k + 1:]
+        if len(g1) < 2 or len(g2) < 2:
+            return False
+
+        def has_contrast(s):
+            lo, hi = np.min(s), np.max(s)
+            return lo > 0 and (hi / lo) > TWO_SYS_CONTRAST
+
+        return bool(has_contrast(g1) and has_contrast(g2))
+
+    @staticmethod
+    def _width_census(sig):
+        """Count components by width class -- narrow / medium / broad. The
+        three bins partition the components, so CNT_N + CNT_M + CNT_B == N_KIN.
+        Purely descriptive: unlike N_BROAD this ignores the relative-broad rule."""
+        s = np.asarray(sig, float)
+        return {
+            'CNT_N': int(np.sum(s < WIDTH_NARROW_MAX)),
+            'CNT_M': int(np.sum((s >= WIDTH_NARROW_MAX) & (s < WIDTH_MEDIUM_MAX))),
+            'CNT_B': int(np.sum(s >= WIDTH_MEDIUM_MAX)),
+        }
+
+    @staticmethod
+    def _rotation_subclass(amp_ratio):
+        """Split a symmetric double by the peak-amplitude ratio of its two
+        components:
+            1/ROT_AMP_SYM  <= r <= ROT_AMP_SYM   -> 'rotation'
+            1/ROT_AMP_ASYM <= r <  1/ROT_AMP_SYM
+              or ROT_AMP_SYM < r <= ROT_AMP_ASYM -> 'asymmetry'
+            otherwise                            -> 'ambiguous'
+        The ratio is folded to >= 1 first, so the bands are symmetric about 1
+        and the answer does not depend on which component is the numerator.
+        Falls back to 'rotation' when no amplitude information is available.
+        """
+        if not np.isfinite(amp_ratio) or amp_ratio <= 0:
+            return 'rotation'
+        r = amp_ratio if amp_ratio >= 1.0 else 1.0 / amp_ratio
+        if r <= ROT_AMP_SYM:
+            return 'rotation'
+        if r <= ROT_AMP_ASYM:
+            return 'asymmetry'
+        return 'ambiguous'
+
+    def _kinematic_class_one(self, dv, sigma, flux, amp=None):
+        """Classify one target's components into a line-profile-shape class.
+        Returns (class_str, flags_dict). `dv`, `sigma`, `flux`, `amp` are 1D
+        arrays (any order); `sigma` are the deconvolved velocity sigmas [km/s].
+        `amp` (peak amplitude on a common anchor line) is only used for the
+        2-component, non-SD split; if omitted those fall back to 'outflow'."""
+        dv = np.asarray(dv, float)
+        sigma = np.asarray(sigma, float)
+        flux = np.asarray(flux, float)
+        amp = None if amp is None else np.asarray(amp, float)
+        n = len(dv)
+        if n == 0:
+            return 'ambiguous', {'N_KIN': 0, 'HAS_SD': False, 'HAS_CEN': False,
+                                 'HAS_BROAD': False, 'N_BROAD': 0,
+                                 'TWO_SYS': False, 'V_REF': np.nan,
+                                 'AMP_RATIO': np.nan,
+                                 **self._width_census([])}
+        if n == 1:
+            return 'single', {'N_KIN': 1, 'V_REF': float(dv[0]),
+                              'HAS_SD': False, 'HAS_CEN': False,
+                              'HAS_BROAD': bool(sigma[0] >= BROAD_SIGMA_THRESHOLD),
+                              'N_BROAD': int(sigma[0] >= BROAD_SIGMA_THRESHOLD),
+                              'TWO_SYS': False, 'AMP_RATIO': np.nan,
+                              **self._width_census(sigma)}
+
+        order = np.argsort(dv)
+        dv, sigma, flux = dv[order], sigma[order], flux[order]
+        if amp is not None:
+            amp = amp[order]
+        # floor widths at the resolution so unresolved spikes can't drive ratios
+        sig_f = np.maximum(sigma, CLASS_SIGMA_FLOOR)
+
+        is_broad = sig_f >= BROAD_SIGMA_THRESHOLD
+        # relative broad (n>=3): a single component whose width stands out from
+        # the rest -- widest / second-widest above SD_WIDTH_RATIO_MAX -- counts
+        # as a broad (outflow-like) component even if it is below the absolute
+        # BROAD_SIGMA_THRESHOLD. Comparing to the SECOND-widest (not to the rims)
+        # keeps a moderately-wide central-ISM head from being mislabelled.
+        if n >= 3:
+            wsort = np.sort(sig_f)
+            if wsort[-2] > 0 and (wsort[-1] / wsort[-2]) > SD_WIDTH_RATIO_MAX:
+                is_broad[int(np.argmax(sig_f))] = True
+        has_broad = bool(is_broad.any())
+
+        # internal, systemic-free reference: flux-weighted mean of non-broad comps
+        ref_mask = ~is_broad if (~is_broad).any() else np.ones(n, bool)
+        w = np.clip(flux[ref_mask], 0, None)
+        if w.sum() > 0:
+            v_ref = float(np.average(dv[ref_mask], weights=w))
+        else:
+            v_ref = float(np.mean(dv[ref_mask]))
+
+        # --- SD: straddling pair of comparable-width, non-broad components ---
+        cand = [i for i in range(n) if not is_broad[i]]
+        sd_pair, best_asym = None, np.inf
+        for a in range(len(cand)):
+            for b in range(a + 1, len(cand)):
+                i, j = cand[a], cand[b]
+                if not (dv[i] < v_ref < dv[j]):               # must straddle
+                    continue
+                # comparable widths -- either the ratio is within
+                # SD_WIDTH_RATIO_MAX, or BOTH components sit in the narrow
+                # regime (sigma < WIDTH_NARROW_MAX). At small widths the ratio
+                # is very sensitive (and close to the resolution floor), so two
+                # genuinely narrow rims still count as a double even if their
+                # ratio formally exceeds the limit.
+                lo, hi = sorted((sig_f[i], sig_f[j]))
+                both_narrow = (sig_f[i] < WIDTH_NARROW_MAX and
+                               sig_f[j] < WIDTH_NARROW_MAX)
+                if lo <= 0 or ((hi / lo) > SD_WIDTH_RATIO_MAX and not both_narrow):
+                    continue
+                # separation test. For a 2-component fit use the PEAK-TO-PEAK
+                # separation: v_ref is the flux-weighted mean of just these two,
+                # so an unequal flux ratio pulls it onto the brighter component
+                # and its |dv - v_ref| would fail spuriously. For 3-/4-component
+                # fits keep the per-component offset from the reference.
+                if n == 2:
+                    if abs(dv[j] - dv[i]) < SD_MIN_SEP:
+                        continue
+                elif abs(dv[i] - v_ref) < SD_MIN_SEP or abs(dv[j] - v_ref) < SD_MIN_SEP:
+                    continue
+                asym = abs(abs(dv[i] - v_ref) - abs(dv[j] - v_ref))
+                if asym < best_asym:                          # keep most symmetric pair
+                    best_asym, sd_pair = asym, (i, j)
+        has_sd = sd_pair is not None
+
+        # --- CEN: a non-broad component sitting BETWEEN the two SD (rim)
+        #     components -- the central head. Only defined when an SD pair
+        #     exists; no proximity-to-reference tolerance is required (per Fred). ---
+        cen_idx = None
+        if sd_pair is not None:
+            lo_dv, hi_dv = sorted((dv[sd_pair[0]], dv[sd_pair[1]]))
+            for i in range(n):
+                if is_broad[i] or i in sd_pair:
+                    continue
+                if lo_dv < dv[i] < hi_dv:
+                    cen_idx = i
+                    break
+        has_cen = cen_idx is not None
+
+        two_sys = self._is_two_systems(dv, sig_f)
+        n_broad = int(is_broad.sum())
+
+        # peak-amplitude ratio.
+        #   * when an SD pair exists -> ratio of the PAIR (blue/red), used to
+        #     split 'rotation' into rotation / asymmetry / ambiguous. Those
+        #     bands are symmetric about 1, so the numerator choice is irrelevant.
+        #   * otherwise, for a 2-comp fit -> narrow/wide, used for the
+        #     2-width / outflow split (those bands are NOT symmetric, so the
+        #     narrow-over-wide order matters).
+        amp_ratio = np.nan
+        if amp is not None:
+            if sd_pair is not None:
+                i, j = sd_pair
+                if np.isfinite(amp[i]) and np.isfinite(amp[j]) and amp[j] > 0:
+                    amp_ratio = float(amp[i] / amp[j])
+            elif n == 2:
+                i_n, i_w = int(np.argmin(sig_f)), int(np.argmax(sig_f))
+                if np.isfinite(amp[i_n]) and np.isfinite(amp[i_w]) and amp[i_w] > 0:
+                    amp_ratio = float(amp[i_n] / amp[i_w])
+
+        # --- priority decision tree --------------------------------------
+        if two_sys:
+            kin = '2-pairs'
+        elif n in (2, 3) and n_broad >= 2:
+            # two broad components in a 2- or 3-component fit is degenerate /
+            # unreliable -- don't try to interpret the shape.
+            kin = 'ambiguous'
+        elif has_sd and has_cen and has_broad:
+            kin = 'rotation+central+outflow'
+        elif has_sd and has_broad:
+            kin = 'rotation+outflow'
+        elif has_sd and has_cen:
+            kin = 'rotation+central'
+        elif has_sd:
+            kin = self._rotation_subclass(amp_ratio)
+        elif n == 2:
+            # not a symmetric double -> split on the narrow/wide amplitude
+            # ratio (see AMP_RATIO_* above). Without amplitudes, fall back to
+            # the previous behaviour.
+            if amp is None:
+                kin = 'outflow'
+            elif not np.isfinite(amp_ratio) or amp_ratio < AMP_RATIO_AMBIG:
+                kin = 'ambiguous'
+            elif amp_ratio <= AMP_RATIO_OUTFLOW:
+                kin = '2-width'
+            else:
+                kin = 'outflow'
+        elif n >= 3 and self._distinct_widths(sig_f):
+            kin = f'{n}-width'          # '3-width' (3 comp) or '4-width' (4 comp)
+        elif has_broad:
+            kin = 'outflow'
+        else:
+            kin = 'ambiguous'
+
+        flags = {
+            'N_KIN':     int(n),
+            'HAS_SD':    bool(has_sd),
+            'HAS_CEN':   bool(has_cen),
+            'HAS_BROAD': bool(has_broad),
+            'N_BROAD':   int(n_broad),
+            'TWO_SYS':   bool(two_sys),
+            'V_REF':     float(v_ref),
+            'AMP_RATIO': float(amp_ratio),   # SD-pair ratio, else narrow/wide (2-comp)
+            **self._width_census(sigma),     # CNT_N / CNT_M / CNT_B width census
+        }
+        return kin, flags
+
+    @staticmethod
+    def _pick_amp_line(sub, kept_index, sig_f):
+        """
+        Choose the line on which the narrow/wide peak-amplitude ratio is
+        measured, and return (line_name, amp_array_aligned_to_kept_index).
+
+        For a 2-component system: among QUALIFY_ANCHOR_LINES, keep only the
+        lines in which BOTH components are individually detected (the SIG flag,
+        i.e. amp > SNR_SIG_THRESHOLD * background), then pick the line with the
+        LARGEST peak amplitude of the WIDE component. The wide component is the
+        harder of the two to constrain, so measuring the ratio where it is
+        strongest gives the most reliable value.
+
+        Falls back to the brightest line when n != 2 or when no anchor line has
+        both components detected.
+        """
+        def amps_for(line):
+            s = sub[sub['LINE'] == line]
+            if s.empty:
+                return None, None
+            s = s.set_index('COMP_IDX')
+            a = s['AMP'].reindex(kept_index).to_numpy(float)
+            d = (s['SIG'].reindex(kept_index).fillna(False).to_numpy(bool)
+                 if 'SIG' in s.columns else np.ones(len(kept_index), bool))
+            return a, d
+
+        if len(kept_index) == 2:
+            i_n, i_w = int(np.argmin(sig_f)), int(np.argmax(sig_f))
+            best = None
+            for line in QUALIFY_ANCHOR_LINES:
+                a, d = amps_for(line)
+                if a is None or not np.all(np.isfinite(a)):
+                    continue
+                if not (bool(d[i_n]) and bool(d[i_w])):   # both must be >3 S/N
+                    continue
+                if a[i_w] <= 0:
+                    continue
+                if best is None or a[i_w] > best[0]:      # rank by WIDE-comp amplitude
+                    best = (a[i_w], line, a)
+            if best is not None:
+                return best[1], best[2]
+
+        tot_by_line = sub.groupby('LINE')['FLUX'].sum()   # fallback: brightest
+        if not len(tot_by_line):
+            return None, None
+        line = tot_by_line.idxmax()
+        a, _ = amps_for(line)
+        return line, a
+
+    def classify_kinematics(self, dp_components: pd.DataFrame, drop_insig: bool = True):
+        """
+        Stage-4 line-profile-shape classification, one row per TARGETID.
+
+        Parameters
+        ----------
+        dp_components : tidy component table (from fit_dp / fit_all).
+        drop_insig    : if True, ignore components flagged COMP_INSIG (no line
+                        detected above SNR_SIG_THRESHOLD) when classifying.
+
+        Returns
+        -------
+        DataFrame: TARGETID, KIN_CLASS, N_KIN, HAS_SD, HAS_CEN, HAS_BROAD,
+                   N_BROAD, TWO_SYS, V_REF, AMP_RATIO, AMP_LINE,
+                   CNT_N, CNT_M, CNT_B.
+        CNT_N / CNT_M / CNT_B are a width census of the components -- narrow
+        (sigma < WIDTH_NARROW_MAX), medium, broad (sigma >= WIDTH_MEDIUM_MAX) --
+        and always sum to N_KIN.
+        KIN_CLASS in {'rotation', 'asymmetry', 'rotation+central',
+        'rotation+outflow', 'rotation+central+outflow', 'outflow', '2-width',
+        '3-width', '4-width', '2-pairs', 'single', 'ambiguous'}.
+        ('asymmetry' is a symmetric double whose two peaks differ strongly in
+        amplitude -- see _rotation_subclass.)
+
+        For 2-component systems the amplitude ratio is measured on the anchor
+        line chosen by _pick_amp_line: among QUALIFY_ANCHOR_LINES, the lines
+        where BOTH components are detected (>3 S/N) are ranked by the peak
+        amplitude of the WIDE component and the LARGEST is used. Otherwise the
+        brightest line is used. The chosen line is reported as AMP_LINE.
+        """
+        def per_target(sub):
+            g = sub.groupby('COMP_IDX')
+            comp_index = g['DV'].first().index
+            dv = g['DV'].first().to_numpy(float)
+            sigma = g['SIGMA'].first().to_numpy(float)
+            flux = g['FLUX'].sum().to_numpy(float)       # brightness weight
+
+            keep = np.ones(len(dv), bool)
+            if drop_insig and 'COMP_INSIG' in sub.columns:
+                k = ~g['COMP_INSIG'].first().to_numpy(bool)
+                if k.any():                               # never drop everything
+                    keep = k
+            dv, sigma, flux = dv[keep], sigma[keep], flux[keep]
+            kept_index = comp_index[keep]
+
+            # anchor line for the narrow/wide amplitude ratio (2-comp rule)
+            sig_f = np.maximum(sigma, CLASS_SIGMA_FLOOR)
+            anchor, amp = self._pick_amp_line(sub, kept_index, sig_f)
+
+            kin, flags = self._kinematic_class_one(dv, sigma, flux, amp)
+            return pd.Series({'KIN_CLASS': kin, **flags, 'AMP_LINE': anchor})
+
+        out = (dp_components
+               .groupby('TARGETID')
+               .apply(per_target)
                .reset_index())
         return out
 

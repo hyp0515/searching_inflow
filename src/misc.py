@@ -9,6 +9,77 @@ from astropy.cosmology import Planck18 as cosmo
 c = const.c.cgs.value * 1e-5  # speed of light in km/s
 desi_wavelength = np.arange(3600, 9824 + .8, .8) # DESI's observe wavelength
 
+# ---------------------------------------------------------------------------
+# DESI spectral resolution (instrumental line-spread function)
+# ---------------------------------------------------------------------------
+# The spectral BIN (0.8 A) is NOT the spectral resolution. The resolution is
+# set by the instrument LSF and is quoted as the resolving power R = lambda/dlam,
+# where dlam is the FWHM of the LSF. DESI has three camera arms with different R
+# (DESI instrument design; R = lambda/FWHM):
+#     Blue     3600-5550 A   R = 2000 - 3200
+#     Red      5550-6560 A   R = 3200 - 4100
+#     Infrared 6560-9800 A   R = 4100 - 5000
+# We approximate R as piecewise-linear in observed-frame wavelength.
+#
+# IMPORTANT: R depends on the OBSERVED-frame wavelength (that is where the light
+# actually hit the spectrograph), so always pass lambda_obs = lambda_rest*(1+z),
+# NOT the rest-frame wavelength.
+_desi_R_lam = np.array([3600., 5550., 5550., 6560., 6560., 9800.])  # observed A
+_desi_R_val = np.array([2000., 3200., 3200., 4100., 4100., 5000.])
+FWHM2SIGMA = 1.0 / (2.0 * np.sqrt(2.0 * np.log(2.0)))  # ~0.42466
+
+def desi_resolving_power(lam_obs):
+    """
+    Piecewise-linear DESI resolving power R = lambda / FWHM.
+
+    Parameters
+    ----------
+    lam_obs : float or array-like
+        OBSERVED-frame wavelength in Angstroms (= lambda_rest * (1 + z)).
+
+    Returns
+    -------
+    float or ndarray
+        Resolving power R at the given wavelength(s).
+    """
+    return np.interp(lam_obs, _desi_R_lam, _desi_R_val)
+
+def desi_sigma_resolution_vel(lam_obs):
+    """
+    Instrumental LSF sigma in velocity units (km/s).
+
+    Since sigma_v = c / (2.3548 * R), the velocity dispersion is frame-invariant
+    (both lambda and sigma_lambda scale by (1+z)); the only frame dependence is
+    that R must be evaluated at the OBSERVED-frame wavelength.
+
+    Parameters
+    ----------
+    lam_obs : float or array-like
+        OBSERVED-frame wavelength in Angstroms (= lambda_rest * (1 + z)).
+
+    Returns
+    -------
+    float or ndarray
+        Instrumental sigma in km/s. Add in quadrature to the intrinsic sigma.
+    """
+    return c * FWHM2SIGMA / desi_resolving_power(lam_obs)
+
+def desi_sigma_resolution_lam(lam_obs):
+    """
+    Instrumental LSF sigma in wavelength units (Angstroms), in the OBSERVED frame.
+
+    Parameters
+    ----------
+    lam_obs : float or array-like
+        OBSERVED-frame wavelength in Angstroms (= lambda_rest * (1 + z)).
+
+    Returns
+    -------
+    float or ndarray
+        Instrumental sigma in Angstroms (observed frame).
+    """
+    return lam_obs * FWHM2SIGMA / desi_resolving_power(lam_obs)
+
 # https://astronomy.nmsu.edu/drewski/tableofemissionlines.html
 lines_air = {
     'Halpha'    : [6562.819],
