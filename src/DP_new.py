@@ -658,8 +658,9 @@ class DP:
         n = len(dv)
 
         flags = {'N_KIN': int(n), 'N_WING': 0, 'WING_KIND': None, 'WING_DV': np.nan,
-                 'WING_IDX': np.nan, 'SYM': None, 'BROAD_DOM': False, 'V_REF': np.nan,
-                 'AMP_RATIO': np.nan, 'REASON': '', **self._width_census(sigma)}
+                 'WING_IDX': np.nan, 'WING_SIGMA': np.nan, 'SYM': None,
+                 'BROAD_DOM': False, 'V_REF': np.nan, 'AMP_RATIO': np.nan,
+                 'REASON': '', **self._width_census(sigma)}
         if n == 0:
             flags['REASON'] = 'no components'
             return 'ambiguous', flags
@@ -716,7 +717,8 @@ class DP:
         if k:
             widest_wing = wings[int(np.argmax([w[i] for i in wings]))]
             flags['WING_DV'] = float(dv[widest_wing])
-            flags['WING_IDX'] = float(o[widest_wing])   # un-sort back to input order
+            flags['WING_SIGMA'] = float(sigma[widest_wing])   # deconvolved velocity sigma
+            flags['WING_IDX'] = float(o[widest_wing])         # un-sort back to input order
             kinds = set('ABSOLUTE' if w[i] >= BROAD_WIDTH else 'RELATIVE' for i in wings)
             flags['WING_KIND'] = kinds.pop() if len(kinds) == 1 else 'MIXED'
 
@@ -943,7 +945,7 @@ class DP:
     _BPT_COUNT_COL = {1: 'CNT_SF', 4: 'CNT_COMP', 16: 'CNT_AGN', 64: 'CNT_LINER'}
 
     def classify_kinematics(self, dp_components: pd.DataFrame, drop_insig: bool = True,
-                            bpt: pd.DataFrame = None):
+                            bpt: pd.DataFrame = None, dp_parent: pd.DataFrame = None):
         """
         Stage-4 line-profile-shape classification, one row per TARGETID.
 
@@ -957,15 +959,22 @@ class DP:
                         CNT_SF / CNT_COMP / CNT_AGN / CNT_LINER are added, tallying
                         the BPT class of each (kept) component per target
                         (codes 1/4/16/64; 256='uncertain' is not counted).
+        dp_parent     : optional parent table (needs TARGETID, Z). When given
+                        together with `bpt`, a LOGSFR column is added: the total
+                        star-formation rate (log10, from Halpha/Hbeta) summed
+                        over the components classified SF or COMP only. It is
+                        None (NaN) when the system has no SF/COMP component.
 
         Returns
         -------
         DataFrame: TARGETID, KIN_CLASS, N_KIN, N_WING, WING_KIND, WING_DV,
-                   WING_IDX, SYM, BROAD_DOM, V_REF, AMP_RATIO, AMP_LINE, CNT_N,
-                   CNT_M, CNT_B, REASON [, CNT_SF, CNT_COMP, CNT_AGN, CNT_LINER
-                   if `bpt` is given].
-        WING_IDX is the COMP_IDX of the wing of record (widest wing), or -1 if
-        the system has no wing.
+                   WING_SIGMA, WING_IDX, SYM, BROAD_DOM, V_REF, AMP_RATIO,
+                   AMP_LINE, CNT_N, CNT_M, CNT_B, REASON [, CNT_SF, CNT_COMP,
+                   CNT_AGN, CNT_LINER if `bpt` is given] [, LOGSFR if `bpt`
+                   and `dp_parent` are given].
+        WING_DV / WING_SIGMA are the velocity offset and deconvolved sigma of
+        the wing of record (widest wing); WING_IDX is its COMP_IDX (-1 if the
+        system has no wing).
         REASON is a short human-readable string giving the rule that matched
         (for classified objects) or the first failed check (for 'ambiguous').
         WING_DV is the velocity offset of the wing (same frame as DV), reported
@@ -992,6 +1001,10 @@ class DP:
         if bpt is not None:
             bpt_map = {(int(t), int(c)): int(b) for t, c, b
                        in zip(bpt['TARGETID'], bpt['COMP_IDX'], bpt['BPT'])}
+        z_map = {}
+        if dp_parent is not None:
+            z_map = dict(zip(dp_parent['TARGETID'].astype(int), dp_parent['Z'].astype(float)))
+        compute_sfr = bool(bpt_map) and bool(z_map)
 
         def per_target(sub):
             g = sub.groupby('COMP_IDX')
@@ -1018,16 +1031,38 @@ class DP:
             flags['WING_IDX'] = (int(kept_index[int(wpos)])
                                  if wpos is not None and np.isfinite(wpos) else -1)
             row = {'KIN_CLASS': kin, **flags, 'AMP_LINE': anchor}
+            tid = int(sub['TARGETID'].iloc[0])
 
             # per-target BPT census over the kept components (if BPT supplied)
             if bpt_map:
                 counts = {col: 0 for col in self._BPT_COUNT_COL.values()}
-                tid = int(sub['TARGETID'].iloc[0])
                 for ci in kept_index:
                     col = self._BPT_COUNT_COL.get(bpt_map.get((tid, int(ci))))
                     if col:
                         counts[col] += 1
                 row.update(counts)
+
+            # SFR from the SF/COMP components only (BPT codes 1, 4). None (NaN)
+            # if the system has no SF/COMP component.
+            if compute_sfr:
+                sf_idx = [int(ci) for ci in kept_index
+                          if bpt_map.get((tid, int(ci))) in (1, 4)]
+                logsfr, z = np.nan, z_map.get(tid)
+                if sf_idx and z is not None:
+                    tot = 0.0
+                    for ci in sf_idx:
+                        cs = sub[sub['COMP_IDX'] == ci].set_index('LINE')
+                        if 'Halpha' not in cs.index or 'Hbeta' not in cs.index:
+                            continue
+                        f_ha = float(cs.loc['Halpha', 'FLUX'])
+                        f_hb = float(cs.loc['Hbeta', 'FLUX'])
+                        if 'NOISE3' in cs.columns:
+                            f_hb = max(f_hb, float(cs.loc['Hbeta', 'NOISE3']) / 3)
+                        if f_ha > 0 and f_hb > 0:
+                            tot += sfr(f_ha, f_hb, z)          # misc.sfr
+                    if tot > 0:
+                        logsfr = float(np.log10(tot))
+                row['LOGSFR'] = logsfr
             return pd.Series(row)
 
         out = (dp_components
