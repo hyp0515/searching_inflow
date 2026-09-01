@@ -7,7 +7,15 @@ from scipy.stats import f
 
 class FitSpectrum:
     def __init__(self,):
-        pass
+        # Optional hook used by the stability / convergence checks.
+        # When set to a callable it is invoked just before curve_fit as
+        #     p0_new = p0_perturb(np.asarray(p0), np.asarray(lower), np.asarray(upper))
+        # and must return a starting vector of the same length (it is clipped
+        # back inside the bounds regardless). Default None -> the fit uses the
+        # deterministic default p0 exactly as before. It can be passed per-call
+        # to fit_multi_emission_vel, or set once on the instance so that it also
+        # takes effect through DP.fit_dp (which calls the shared module FIT).
+        self.p0_perturb = None
 
     def mask_bad_pixel(self, array_to_mask, mask):
         bad_mask = (mask != 0)
@@ -110,9 +118,10 @@ class FitSpectrum:
     
     
 
-    def fit_multi_emission_vel(self, data_class:Spectrum, 
-                               id=None, n_components=1, w_dz=False, two_component=None):
-        
+    def fit_multi_emission_vel(self, data_class:Spectrum,
+                               id=None, n_components=1, w_dz=False, two_component=None,
+                               p0_perturb=None):
+
         # Backward compatibility: convert two_component boolean to n_components
         if two_component is not None:
             n_components = 2 if two_component else 1
@@ -342,6 +351,18 @@ class FitSpectrum:
         p0 = p0_list
         bounds_lower = bounds_lower_list
         bounds_upper = bounds_upper_list
+
+        # Optional randomized starting point for the convergence/stability tests.
+        # Falls back to the per-call argument, then the instance attribute, then
+        # None (deterministic default). The returned vector is clipped strictly
+        # inside the bounds so curve_fit never rejects it.
+        perturb = p0_perturb if p0_perturb is not None else getattr(self, 'p0_perturb', None)
+        if perturb is not None:
+            lo = np.asarray(bounds_lower, dtype=float)
+            hi = np.asarray(bounds_upper, dtype=float)
+            p0 = np.asarray(perturb(np.asarray(p0, dtype=float), lo, hi), dtype=float)
+            eps = 1e-9 * (hi - lo)
+            p0 = np.clip(p0, lo + eps, hi - eps)
 
         popt, pcov = curve_fit(fitting_func, combine_lam, combine_flux, p0=p0, sigma=combine_sigma, bounds=(bounds_lower, bounds_upper), absolute_sigma=True)
         # print(popt)
