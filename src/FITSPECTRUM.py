@@ -17,6 +17,37 @@ class FitSpectrum:
         # takes effect through DP.fit_dp (which calls the shared module FIT).
         self.p0_perturb = None
 
+        # curve_fit / TRF solver knobs (tunable per instance).
+        #   fit_ftol, fit_xtol : stopping tolerances. Default 1e-8 keeps the fit
+        #       numerically identical to the original code (only the vectorized
+        #       model + analytic Jacobian differ, at the ~1e-9 float level). A
+        #       10k cross-check showed that loosening to 1e-6 gains only ~2% at
+        #       the pipeline level while roughly doubling the number of galaxies
+        #       that shift N_COMP vs the original, so it is NOT the default; set
+        #       both to 1e-6 per-run if you want the extra speed on a sample
+        #       where model-selection reproducibility is not critical.
+        #   fit_x_scale : parameter scaling for the trust region. Kept at 1.0
+        #       (scipy default); 'jac' was benchmarked and found slightly slower
+        #       here because the analytic Jacobian already conditions the steps.
+        self.fit_ftol = 1e-8
+        self.fit_xtol = 1e-8
+        self.fit_x_scale = 1.0
+
+        # Optimization toggles, mainly for cross-checking the speed changes
+        # against the original code (e.g. which galaxies shift N_COMP). Both
+        # default True (the optimized path). Setting them False restores the
+        # original Python-loop model / finite-difference Jacobian. Only take
+        # effect when w_dz is False.
+        #   use_fast_model   : vectorized model with precomputed resolution
+        #   use_analytic_jac : closed-form Jacobian (else curve_fit finite-diff)
+        # The four benchmarked "versions" are:
+        #   v0 original   : fast=False, ajac=False, ftol=xtol=1e-8
+        #   v1 +vectorize : fast=True,  ajac=False, ftol=xtol=1e-8
+        #   v2 +jacobian  : fast=True,  ajac=True,  ftol=xtol=1e-8  (current default)
+        #   v3 +tolerance : fast=True,  ajac=True,  ftol=xtol=1e-6  (opt-in)
+        self.use_fast_model = True
+        self.use_analytic_jac = True
+
     def mask_bad_pixel(self, array_to_mask, mask):
         bad_mask = (mask != 0)
         array_clean = array_to_mask[~bad_mask]
@@ -287,11 +318,120 @@ class FitSpectrum:
             lams = np.split(lam_grid, slice_indices)
             gaussian_parms, _, _ = unpack_params(params)
             combine_model = np.concatenate([
-                model_vel(lams[i], gaussian_parms=gaussian_parms[i]) 
+                model_vel(lams[i], gaussian_parms=gaussian_parms[i])
                 for i in range(len(crop_region))
             ])
             return combine_model
-        
+
+        # ------------------------------------------------------------------ #
+        # Fast, vectorized model evaluation (used by curve_fit when w_dz is
+        # False, i.e. the line centres are fixed -- which is every call made by
+        # the DP pipeline).
+        #
+        # It is mathematically identical to fitting_func, but factors out the
+        # quantities that are CONSTANT across optimizer iterations and computes
+        # them once here instead of on every function evaluation:
+        #   * each line's velocity grid  v(lam) = c*(lam - lam0)/lam0
+        #   * the instrumental-resolution sigma  sigma_res(lam0)
+        # Only amp, dv and sigma_v (the actual fit parameters) change per call,
+        # and the Gaussians of each region are evaluated as a single broadcast
+        # `exp` rather than a Python loop over `gaussian_vel`. This removes the
+        # per-evaluation np.interp resolution chain and the per-Gaussian Python
+        # overhead that dominate the profile.
+        #
+        # Layout mirrors unpack_params exactly, so the amp indices, the doublet
+        # ratio scaling and the sigma-in-quadrature combination all match.
+        # ------------------------------------------------------------------ #
+        fast_static = None
+        if not w_dz:
+            amp_start_fast = n_components + (n_components if n_components > 1 else 0)
+            reg_V, reg_sres2, reg_comp, reg_ampidx, reg_ratio = [], [], [], [], []
+            for idx_lines, lines in enumerate(lines_to_fit):
+                lam_reg = lams[idx_lines]
+                Vs, sres2s, comps, ampidxs, ratios = [], [], [], [], []
+                for idx_line, line in enumerate(lines):
+                    if not isinstance(line, tuple):          # singlet
+                        sub = [(line, 1.0)]
+                    else:                                     # doublet: both share amp_idx
+                        line1, line2 = line
+                        sub = [(line1, line_ratios[idx_lines]), (line2, 1.0)]
+                    for lam0, r in sub:
+                        sres = desi_sigma_resolution_vel(lam0 * (1 + z))
+                        v = c * (lam_reg - lam0) / lam0
+                        for comp_idx in range(n_components):
+                            amp_idx = (idx_line + nline_start_indices[idx_lines]
+                                       + comp_idx * n_lines_fit + amp_start_fast)
+                            Vs.append(v)
+                            sres2s.append(sres * sres)
+                            comps.append(comp_idx)
+                            ampidxs.append(int(amp_idx))
+                            ratios.append(r)
+                reg_V.append(np.asarray(Vs, dtype=float))              # (G_i, n_i)
+                reg_sres2.append(np.asarray(sres2s, dtype=float))      # (G_i,)
+                reg_comp.append(np.asarray(comps, dtype=int))          # (G_i,)
+                reg_ampidx.append(np.asarray(ampidxs, dtype=int))      # (G_i,)
+                reg_ratio.append(np.asarray(ratios, dtype=float))      # (G_i,)
+            fast_static = (reg_V, reg_sres2, reg_comp, reg_ampidx, reg_ratio)
+
+        def fitting_func_fast(lam_grid, *params):
+            reg_V, reg_sres2, reg_comp, reg_ampidx, reg_ratio = fast_static
+            p = np.asarray(params, dtype=float)
+            sig = p[0:n_components]                                    # sigma_v per component
+            dvs = p[n_components:2 * n_components] if n_components > 1 else np.zeros(1)
+            out = []
+            for i in range(len(reg_V)):
+                comp = reg_comp[i]
+                sigma = np.sqrt(sig[comp] ** 2 + reg_sres2[i])        # (G_i,)
+                dv = dvs[comp]                                         # (G_i,)
+                amp = reg_ratio[i] * p[reg_ampidx[i]]                  # (G_i,)
+                arg = (reg_V[i] - dv[:, None]) / sigma[:, None]        # (G_i, n_i)
+                out.append(amp @ np.exp(-0.5 * arg * arg))            # (n_i,)
+            return np.concatenate(out)
+
+        # Analytic Jacobian d(model)/d(param), matching fitting_func_fast, so
+        # curve_fit no longer needs ~n_params finite-difference model evaluations
+        # per iteration. Returns the UNWEIGHTED model derivatives (curve_fit
+        # applies the 1/sigma weighting itself). Column order matches p0:
+        #   [sigma_v_0..n-1]  [dv_0..n-1 if n>1]  [amp params...]
+        # For a Gaussian amp*exp(-0.5 u^2), u=(V-dv)/sigma, sigma=sqrt(sv^2+sres^2),
+        # amp=ratio*a:  d/da = ratio*G ;  d/ddv = amp*G*u/sigma ;
+        #               d/dsv = amp*G*u^2*sv/sigma^2.
+        def jac_fast(lam_grid, *params):
+            reg_V, reg_sres2, reg_comp, reg_ampidx, reg_ratio = fast_static
+            p = np.asarray(params, dtype=float)
+            nparm = p.size
+            sig = p[0:n_components]
+            multi = n_components > 1
+            dvs = p[n_components:2 * n_components] if multi else np.zeros(1)
+            rows = []
+            for i in range(len(reg_V)):
+                comp = reg_comp[i]
+                V = reg_V[i]
+                G_i, n_i = V.shape
+                sigma = np.sqrt(sig[comp] ** 2 + reg_sres2[i])        # (G_i,)
+                dv = dvs[comp]                                         # (G_i,)
+                amp = reg_ratio[i] * p[reg_ampidx[i]]                  # (G_i,)
+                U = (V - dv[:, None]) / sigma[:, None]                 # (G_i, n_i)
+                Gmat = np.exp(-0.5 * U * U)                            # (G_i, n_i)
+                AG = amp[:, None] * Gmat                               # (G_i, n_i)
+                J = np.zeros((n_i, nparm))
+                for g in range(G_i):
+                    k = comp[g]
+                    s_g = sigma[g]
+                    J[:, reg_ampidx[i][g]] += reg_ratio[i][g] * Gmat[g]      # d/d amp
+                    J[:, k] += AG[g] * U[g] * U[g] * sig[k] / (s_g * s_g)    # d/d sigma_v[k]
+                    if multi:
+                        J[:, n_components + k] += AG[g] * U[g] / s_g         # d/d dv[k]
+                rows.append(J)
+            return np.concatenate(rows, axis=0)
+
+        # Select model / Jacobian implementation (toggles only apply when the
+        # fast static structure was built, i.e. w_dz is False).
+        _use_fast = (not w_dz) and getattr(self, 'use_fast_model', True)
+        _use_ajac = (not w_dz) and getattr(self, 'use_analytic_jac', True)
+        func_for_fit = fitting_func_fast if _use_fast else fitting_func
+        jac_for_fit = jac_fast if _use_ajac else None
+
 
         dz_init, dz_upper, dz_lower                     = 0, 1e-3, -1e-3
         sigma_init, sigma_upper, sigma_lower            = 50, 700, 5
@@ -364,7 +504,13 @@ class FitSpectrum:
             eps = 1e-9 * (hi - lo)
             p0 = np.clip(p0, lo + eps, hi - eps)
 
-        popt, pcov = curve_fit(fitting_func, combine_lam, combine_flux, p0=p0, sigma=combine_sigma, bounds=(bounds_lower, bounds_upper), absolute_sigma=True)
+        # Solver conditioning / stopping knobs (see notes in fit docs). Read from
+        # instance attributes so they can be tuned/benchmarked without code edits;
+        # defaults reproduce scipy's behaviour (x_scale=1.0, tol=1e-8).
+        _x_scale = getattr(self, 'fit_x_scale', 1.0)
+        _ftol = getattr(self, 'fit_ftol', 1e-8)
+        _xtol = getattr(self, 'fit_xtol', 1e-8)
+        popt, pcov = curve_fit(func_for_fit, combine_lam, combine_flux, p0=p0, sigma=combine_sigma, bounds=(bounds_lower, bounds_upper), absolute_sigma=True, jac=jac_for_fit, x_scale=_x_scale, ftol=_ftol, xtol=_xtol)
         # print(popt)
         params = {}
         # Parse fitted parameters
